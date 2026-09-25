@@ -15,8 +15,9 @@ Multipart:
   frame 1 : packed CommandMessage (65 bytes)
 
 struct CommandMessage {
-    uint8_t command;          // CommandEnum
-    char    ServiceName[32];
+    uint8_t command;          // CommandEnum: start 78, stop 79, restart 81,
+                              //   heartbeat 90, reload 91
+    char    ServiceName[32];  // a service, or "*" for every service
     char    Args[32];         // may be empty
 };
 
@@ -181,9 +182,15 @@ def format_bytes(n: int) -> str:
 
 class CommandEnum(IntEnum):
     """Must match the C++ CommandEnum wire values."""
-    START   = 78
-    STOP    = 79
-    RESTART = 81
+    START     = 78
+    STOP      = 79
+    RESTART   = 81
+    HEARTBEAT = 90  # a service reporting that it is alive
+    RELOAD    = 91  # re-read the configuration file; the service name is ignored
+
+
+# The service name that means every service (docs/protocol.md).
+ALL_SERVICES = "*"
 
 
 class CommandResult(IntEnum):
@@ -306,7 +313,8 @@ def describe_reply(reply: dict) -> str:
     verb = command.name.lower() if isinstance(command, CommandEnum) else f"command {command}"
     result = reply["result"]
     text = RESULT_TEXT.get(result, f"result {int(result)}")
-    line = f"{verb} {reply['serviceName']}: {text}".replace("  ", " ")
+    subject = verb + (f" {reply['serviceName']}" if reply["serviceName"] else "")
+    line = f"{subject}: {text}"
     if reply["message"]:
         line += f" ({reply['message']})"
     return line

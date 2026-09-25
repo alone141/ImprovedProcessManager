@@ -4,6 +4,7 @@ import random
 
 import mock_publisher as mp
 from health_structs import (
+    ALL_SERVICES,
     REPORT_TOPIC,
     CommandEnum,
     CommandResult,
@@ -70,6 +71,19 @@ def test_start_and_restart_answer_like_the_manager():
     assert m.state["control_loop"] == RuntimeState.STARTING and m.restarts["control_loop"] >= 1
     assert m.handle(CommandEnum.START, "ghost", 1_002 * SEC) == (CommandResult.UNKNOWN_SERVICE, "no service named ghost")
     assert m.handle(99, "control_loop", 1_002 * SEC) == (CommandResult.UNKNOWN_COMMAND, "unknown command 99")
+
+
+def test_star_reaches_every_service_and_reload_is_answered():
+    m = manager()
+    assert m.handle(CommandEnum.STOP, ALL_SERVICES, 1_002 * SEC) == (CommandResult.OK, "stop sent to 6 services")
+    assert all(state == RuntimeState.STOPPED for state in m.state.values())
+    assert all(pid == 0 for pid in m.pid.values())
+    assert m.handle(CommandEnum.START, ALL_SERVICES, 1_003 * SEC) == (CommandResult.OK, "start sent to 6 services")
+    assert all(state == RuntimeState.STARTING for state in m.state.values())
+    assert m.handle(CommandEnum.RELOAD, "", 1_004 * SEC) == (CommandResult.OK, "0 added, 0 removed, 0 changed")
+    assert m.reloads == 1
+    assert m.handle(CommandEnum.HEARTBEAT, "control_loop", 1_005 * SEC) == (CommandResult.OK, "")
+    assert m.last_seen["control_loop"] == 1_005 * SEC
 
 
 def test_advance_keeps_the_figures_consistent():

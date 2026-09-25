@@ -8,7 +8,9 @@ ROUTER (bind) – accepts DEALER commands with:
       identity = b"PMC"
       frame0   = b"BPM"
       frame1   = packed CommandMessage (65 B)
-  and answers each with b"BPM" + CommandReply (128 B), like the C++ manager.
+  and answers each with b"BPM" + CommandReply (128 B), like the C++ manager:
+  start / stop / restart of one service or of "*" (every service), heartbeat,
+  and reload (91), which the mock only counts.
 
 The simulation lives in MockManager, so tests can drive it without sockets.
 """
@@ -28,6 +30,7 @@ from typing import Dict, List, Optional, Tuple
 import zmq
 
 from health_structs import (
+    ALL_SERVICES,
     COMMAND_SIZE,
     REPORT_SIZE,
     REPORT_TOPIC,
@@ -161,25 +164,39 @@ class MockManager:
         self.host_memory_total = 16 * GB
         self.host_memory_available = self.rng.randint(4, 10) * GB
         self.host_started_ns = now - self.rng.randint(1, 30) * 86400 * SEC
+        self.reloads = 0
 
     # ── commands ──────────────────────────────────────────────────────────
 
     def handle(self, command, name: str, now_ns: int) -> Tuple[CommandResult, str]:
         """Apply a command the way the manager would; (result, note) for the reply."""
+        if command == CommandEnum.RELOAD:
+            self.reloads += 1
+            return CommandResult.OK, "0 added, 0 removed, 0 changed"
+        if command not in (CommandEnum.START, CommandEnum.STOP, CommandEnum.RESTART):
+            if command == CommandEnum.HEARTBEAT and name in self.state:
+                self.last_seen[name] = now_ns
+                return CommandResult.OK, ""
+            return CommandResult.UNKNOWN_COMMAND, f"unknown command {int(command)}"
+        if name == ALL_SERVICES:
+            for each in self.names:
+                self._apply(command, each, now_ns)
+            return CommandResult.OK, f"{command.name.lower()} sent to {len(self.names)} services"
         if name not in self.state:
             return CommandResult.UNKNOWN_SERVICE, f"no service named {name}"
+        return CommandResult.OK, self._apply(command, name, now_ns)
+
+    def _apply(self, command: CommandEnum, name: str, now_ns: int) -> str:
         if command == CommandEnum.START:
             self._start(name, now_ns)
-            return CommandResult.OK, "starting"
+            return "starting"
         if command == CommandEnum.STOP:
             self._stop(name, now_ns, -15)
-            return CommandResult.OK, "stopped"
-        if command == CommandEnum.RESTART:
-            self._stop(name, now_ns, -15)
-            self.restarts[name] += 1
-            self._start(name, now_ns)
-            return CommandResult.OK, "restarting"
-        return CommandResult.UNKNOWN_COMMAND, f"unknown command {int(command)}"
+            return "stopped"
+        self._stop(name, now_ns, -15)
+        self.restarts[name] += 1
+        self._start(name, now_ns)
+        return "restarting"
 
     def _start(self, name: str, now_ns: int) -> None:
         self.state[name] = RuntimeState.STARTING

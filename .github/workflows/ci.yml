@@ -1,0 +1,232 @@
+# Builds and tests both programs on every push and pull request.
+#
+# The build itself downloads nothing (manager/README.md, "Airgapped machines"):
+# each job installs distribution packages or unpacks the vendored sources
+# *before* configuring, which is what a networked machine does to prepare an
+# offline one. The jobs cover what the design spec listed as never exercised:
+# the vendored third_party/ path, CMake 4, the GCC 10 compiler floor, and the
+# libzmq-dependent tests on Windows.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The versions the vendored jobs unpack into manager/third_party/ (see
+  # manager/third_party/README.md) and the CMake releases the Linux jobs use
+  # when the machine has none new enough.
+  LIBZMQ_TAG: v4.3.5
+  GOOGLETEST_TAG: v1.14.0
+  CMAKE_FLOOR: "3.30"
+  CMAKE_FLOOR_RELEASE: 3.30.9
+  CMAKE_4_RELEASE: 4.4.3
+
+jobs:
+  manager-linux:
+    name: manager · Ubuntu 24.04, distribution packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libzmq and GoogleTest
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libzmq3-dev libgtest-dev pkg-config
+
+      - name: CMake ${{ env.CMAKE_FLOOR }} or newer
+        run: |
+          have="$(cmake --version 2>/dev/null | sed -n 's/^cmake version //p')"
+          if [ -z "$have" ] || [ "$(printf '%s\n' "$CMAKE_FLOOR" "$have" | sort -V | head -n1)" != "$CMAKE_FLOOR" ]; then
+            echo "CMake ${have:-missing} is older than $CMAKE_FLOOR: using Kitware's $CMAKE_FLOOR_RELEASE archive"
+            mkdir -p "$RUNNER_TEMP/cmake"
+            curl -fsSL "https://github.com/Kitware/CMake/releases/download/v$CMAKE_FLOOR_RELEASE/cmake-$CMAKE_FLOOR_RELEASE-linux-x86_64.tar.gz" \
+              | tar -xz -C "$RUNNER_TEMP/cmake" --strip-components=1
+            echo "$RUNNER_TEMP/cmake/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Configure
+        run: |
+          cmake --version
+          cmake -S manager -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+      - name: Command-line smoke test
+        run: |
+          build/src/berayprocessmanager --version
+          build/src/berayprocessmanager --help > /dev/null
+          build/src/berayprocessmanager --check --config manager/config/services.conf
+
+  manager-gcc10:
+    name: manager · GCC 10 (compiler floor)
+    runs-on: ubuntu-24.04
+    container: gcc:10
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libzmq
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends libzmq3-dev pkg-config
+
+      # The distribution's GoogleTest is older than the vendored one; the
+      # sources go where an offline machine would put them.
+      - name: Unpack GoogleTest into third_party
+        uses: actions/checkout@v4
+        with:
+          repository: google/googletest
+          ref: ${{ env.GOOGLETEST_TAG }}
+          path: manager/third_party/googletest
+
+      - name: CMake ${{ env.CMAKE_FLOOR_RELEASE }} (Kitware archive, as the README describes)
+        run: |
+          mkdir -p "$RUNNER_TEMP/cmake"
+          curl -fsSL "https://github.com/Kitware/CMake/releases/download/v$CMAKE_FLOOR_RELEASE/cmake-$CMAKE_FLOOR_RELEASE-linux-x86_64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/cmake" --strip-components=1
+          echo "$RUNNER_TEMP/cmake/bin" >> "$GITHUB_PATH"
+
+      - name: Configure
+        run: |
+          cmake --version
+          g++ --version | head -n1
+          cmake -S manager -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+      - name: Command-line smoke test
+        run: |
+          build/src/berayprocessmanager --version
+          build/src/berayprocessmanager --check --config manager/config/services.conf
+
+  manager-vendored:
+    name: manager · vendored libzmq and GoogleTest, CMake 4
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack libzmq into third_party
+        uses: actions/checkout@v4
+        with:
+          repository: zeromq/libzmq
+          ref: ${{ env.LIBZMQ_TAG }}
+          path: manager/third_party/libzmq
+
+      - name: Unpack GoogleTest into third_party
+        uses: actions/checkout@v4
+        with:
+          repository: google/googletest
+          ref: ${{ env.GOOGLETEST_TAG }}
+          path: manager/third_party/googletest
+
+      - name: CMake ${{ env.CMAKE_4_RELEASE }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/cmake"
+          curl -fsSL "https://github.com/Kitware/CMake/releases/download/v$CMAKE_4_RELEASE/cmake-$CMAKE_4_RELEASE-linux-x86_64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/cmake" --strip-components=1
+          echo "$RUNNER_TEMP/cmake/bin" >> "$GITHUB_PATH"
+
+      - name: Configure
+        run: |
+          cmake --version
+          cmake -S manager -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+      - name: Command-line smoke test
+        run: |
+          build/src/berayprocessmanager --version
+          build/src/berayprocessmanager --check --config manager/config/services.conf
+
+  manager-windows:
+    name: manager · Windows, MSVC, vendored libzmq and GoogleTest
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack libzmq into third_party
+        uses: actions/checkout@v4
+        with:
+          repository: zeromq/libzmq
+          ref: ${{ env.LIBZMQ_TAG }}
+          path: manager/third_party/libzmq
+
+      - name: Unpack GoogleTest into third_party
+        uses: actions/checkout@v4
+        with:
+          repository: google/googletest
+          ref: ${{ env.GOOGLETEST_TAG }}
+          path: manager/third_party/googletest
+
+      - name: Configure
+        run: |
+          cmake --version
+          cmake -S manager -B build -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure --timeout 120
+
+      - name: Command-line smoke test
+        run: |
+          build\src\Release\berayprocessmanager.exe --version
+          build\src\Release\berayprocessmanager.exe --check --config manager\config\services.conf
+
+  gui-tests:
+    name: gui · pytest, ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # The version the standalone executable is built with (gui/README.md).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Qt platform libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1 libglib2.0-0
+
+      - name: Install the GUI's packages and pytest
+        run: python -m pip install -r gui/requirements.txt pytest
+
+      - name: Test
+        working-directory: gui
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q -p no:cacheprovider

@@ -1,5 +1,7 @@
 # Process manager and monitor
 
+[![CI](https://github.com/alone141/ImprovedProcessManager/actions/workflows/ci.yml/badge.svg)](https://github.com/alone141/ImprovedProcessManager/actions/workflows/ci.yml)
+
 Two programs that talk over ZeroMQ:
 
 | Directory | Program | Built with |
@@ -45,3 +47,17 @@ cd gui && pip install -r requirements.txt && python process_monitor_gui.py
 Both programs build for machines without network access: the manager from
 distribution packages or sources placed under `manager/third_party/`, the GUI
 as a standalone executable (`gui/scripts/build_executable.sh`).
+
+## Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push and
+pull request. The build still downloads nothing; each job installs packages or
+unpacks sources first, the way a networked machine prepares an offline one.
+
+| Job | Checks |
+|-----|--------|
+| `manager-linux` | Ubuntu 24.04 with `libzmq3-dev` and `libgtest-dev`, warnings as errors, every test, and `--version` / `--check` on the example configuration |
+| `manager-gcc10` | the compiler floor: GCC 10 with Kitware's CMake 3.30 archive |
+| `manager-vendored` | the offline path: libzmq and GoogleTest sources under `manager/third_party/`, built with CMake 4 |
+| `manager-windows` | MSVC with the vendored libzmq and GoogleTest, every test |
+| `gui-tests` | `pytest` for `gui/` on Ubuntu and Windows with Python 3.10, the version the standalone executable is built with |

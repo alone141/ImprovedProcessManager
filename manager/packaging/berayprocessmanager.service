@@ -1,0 +1,35 @@
+# systemd unit for the process manager. The GUI's manager page reads this unit
+# by name, so keep it berayprocessmanager.service.
+#
+#   sudo cp berayprocessmanager.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now berayprocessmanager
+
+[Unit]
+Description=Beray process manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# The manager reports READY=1 once its sockets are bound and autostart has begun.
+Type=notify
+ExecStart=/usr/local/bin/berayprocessmanager --config /etc/berayprocessmanager/services.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+
+# Lets the manager create task_<name> cgroups below its own, for per-service
+# accounting, limits, whole-service kills and the GUI's journal view.
+Delegate=yes
+
+# SIGTERM goes to the manager only; it stops the services itself, in dependency
+# order, each within its stop_timeout_ms. systemd kills whatever is left after
+# TimeoutStopSec, which should exceed the sum of the stop timeouts.
+KillMode=mixed
+TimeoutStopSec=60
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

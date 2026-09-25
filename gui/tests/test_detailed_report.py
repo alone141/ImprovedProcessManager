@@ -203,6 +203,23 @@ def test_unknown_figures_are_none_and_encode_as_negative():
     assert service["state"] == ServiceState.STOPPED and service["restartMode"] == RestartMode.NEVER
 
 
+@pytest.mark.parametrize("figure", [float("nan"), float("inf"), float("-inf")])
+def test_figures_that_are_not_finite_are_unknown(figure):
+    raw = encode_detailed_report(
+        {
+            "hostCpuPercent": figure,
+            "services": [{"cpuPercent": figure, "gpuValid": True, "gpuPercent": figure}],
+            "gpus": [{"utilizationPercent": figure, "memoryUtilizationPercent": figure}],
+        }
+    )
+    parsed = parse_detailed_report(raw)
+    assert parsed["hostCpuPercent"] is None
+    service = parsed["services"][0]
+    assert service["cpuPercent"] is None and service["gpuPercent"] is None
+    gpu = parsed["gpus"][0]
+    assert gpu["utilizationPercent"] is None and gpu["memoryUtilizationPercent"] is None
+
+
 def test_text_fields_are_cut_at_a_character_boundary():
     raw = encode_detailed_report({"hostName": "h" * 100, "services": [{"name": "ü" * 20}]})
     header = ReportHeader.from_buffer_copy(raw)

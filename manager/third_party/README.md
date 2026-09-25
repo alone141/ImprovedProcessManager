@@ -25,6 +25,7 @@ adds both directories inside a `block()`. Their warnings never fail a
 `-DCMAKE_COMPILE_WARNING_AS_ERROR=ON` build. CMake 4 refuses a
 `cmake_minimum_required` below 3.5, which libzmq and GoogleTest 1.8 declare, so the
 block raises their minimum to 3.5 through `CMAKE_POLICY_VERSION_MINIMUM`; CMake 3
-ignores that variable. This path
-is not exercised by the builds that verified this tree, which used the
-distribution's `libzmq3-dev`; the options follow libzmq's own CMake file.
+ignores that variable. The options follow libzmq's own CMake file. CI
+(`.github/workflows/ci.yml`) builds this path on every push to `main` and every
+pull request, with libzmq 4.3.5 and GoogleTest 1.14.0: with GCC 10 and CMake
+3.30, with CMake 4, and with MSVC on Windows.

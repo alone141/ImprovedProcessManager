@@ -6,6 +6,7 @@ import pytest
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 
+import health_structs as hs
 import process_monitor_gui as pmg
 import usage_graphs as ug
 from gpu_sampler import GpuProcessUsage
@@ -222,6 +223,18 @@ def test_without_manager_figures_for_a_service_nvidia_smi_fills_in(monkeypatch):
     monkeypatch.setattr(pmg.time, "monotonic", lambda: 1_000.0)
     window = recorder(True, {42: GpuProcessUsage(util_pct=30.0, vram_bytes=2 * MB)}, manager_report(gpu_valid=False))
     assert window._gpu_for(window._current["svc"], "svc") == GpuProcessUsage(util_pct=30.0, vram_bytes=2 * MB)
+
+
+def test_a_gpu_figure_that_is_not_finite_is_recorded_as_no_data(monkeypatch):
+    # On the graph's axis it would make nice_ticks raise while painting.
+    monkeypatch.setattr(pmg.time, "monotonic", lambda: 1_000.0)
+    raw = hs.encode_detailed_report(
+        {"gpuMonitoring": True, "services": [{"name": "svc", "gpuValid": True, "gpuPercent": float("inf")}]}
+    )
+    window = recorder(True, {}, hs.parse_detailed_report(raw))
+    ProcessMonitorWindow._record_usage(window, 5.0)
+    [only] = window._usage.samples("svc", 0)
+    assert only.gpu_pct is None
 
 
 def test_a_report_that_stopped_arriving_no_longer_counts(monkeypatch):

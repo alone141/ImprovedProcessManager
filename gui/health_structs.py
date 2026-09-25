@@ -47,6 +47,7 @@ repository; the report layout is manager/src/DetailedReport.cpp.
 from __future__ import annotations
 
 import ctypes
+import math
 from enum import IntEnum
 from typing import List, Optional
 
@@ -497,7 +498,9 @@ def _text(raw: bytes) -> str:
 
 
 def _unknown_if_negative(value: float) -> Optional[float]:
-    return None if value < 0 else float(value)
+    # NaN and infinities are unknown too: no manager sends them, and one that
+    # reached a usage graph would stop the GUI while painting its axis.
+    return float(value) if math.isfinite(value) and value >= 0 else None
 
 
 def service_record_to_dict(record: ServiceRecord) -> dict:

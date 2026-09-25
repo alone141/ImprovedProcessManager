@@ -6,6 +6,7 @@
 #include "ZmqSocket.hpp"
 
 #include <chrono>
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -37,18 +38,30 @@ TEST(ReportPublisherTest, HealthIsOneFrameAndTheReportHasATopic)
     detailed.hostName = "rig";
     process_manager::Message healthMessage{};
     process_manager::Message reportMessage{};
+    // Only the sockets still waiting for their first message are polled. Once the
+    // health frame is in, the wait belongs to the report subscriber, which may still
+    // be joining (a PUB drops messages until the subscription has arrived); polling
+    // the readable health socket as well would return at once and never wait.
     for (int attempt = 0; attempt < 200 && (healthMessage.empty() || reportMessage.empty()); ++attempt)
     {
         publisher.Publish(Records{record, record}, detailed);
-        std::vector<bool> ready{};
-        process_manager::PollReadable(Sockets{&health, &report}, std::chrono::milliseconds{20}, ready);
-        if (ready[0] && healthMessage.empty())
+        Sockets pending{};
+        if (healthMessage.empty())
         {
-            health.Receive(healthMessage, true);
+            pending.push_back(&health);
         }
-        if (ready[1] && reportMessage.empty())
+        if (reportMessage.empty())
         {
-            report.Receive(reportMessage, true);
+            pending.push_back(&report);
+        }
+        std::vector<bool> ready{};
+        process_manager::PollReadable(pending, std::chrono::milliseconds{20}, ready);
+        for (std::size_t i = 0; i < pending.size(); ++i)
+        {
+            if (ready[i])
+            {
+                pending[i]->Receive(pending[i] == &health ? healthMessage : reportMessage, true);
+            }
         }
     }
 

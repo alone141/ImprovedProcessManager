@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install libzmq and GoogleTest
         run: |
@@ -78,17 +78,19 @@ jobs:
     container: gcc:10
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Install libzmq
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends libzmq3-dev pkg-config
+      # Debian 11, which the gcc:10 image is built on, has left the package
+      # mirrors, so both dependencies come from third_party/, the offline way.
+      - name: Unpack libzmq into third_party
+        uses: actions/checkout@v5
+        with:
+          repository: zeromq/libzmq
+          ref: ${{ env.LIBZMQ_TAG }}
+          path: manager/third_party/libzmq
 
-      # The distribution's GoogleTest is older than the vendored one; the
-      # sources go where an offline machine would put them.
       - name: Unpack GoogleTest into third_party
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: google/googletest
           ref: ${{ env.GOOGLETEST_TAG }}
@@ -123,17 +125,17 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Unpack libzmq into third_party
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: zeromq/libzmq
           ref: ${{ env.LIBZMQ_TAG }}
           path: manager/third_party/libzmq
 
       - name: Unpack GoogleTest into third_party
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: google/googletest
           ref: ${{ env.GOOGLETEST_TAG }}
@@ -167,17 +169,17 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Unpack libzmq into third_party
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: zeromq/libzmq
           ref: ${{ env.LIBZMQ_TAG }}
           path: manager/third_party/libzmq
 
       - name: Unpack GoogleTest into third_party
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: google/googletest
           ref: ${{ env.GOOGLETEST_TAG }}
@@ -208,10 +210,10 @@ jobs:
       matrix:
         os: [ubuntu-24.04, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The version the standalone executable is built with (gui/README.md).
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.10"
 

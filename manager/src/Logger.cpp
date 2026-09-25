@@ -57,7 +57,9 @@ std::string LocalTimestamp(std::int64_t wallNs)
 #else
     localtime_r(&seconds, &parts);
 #endif
-    char text[40]{};
+    // Sized for the longest output the format can produce with any int arguments
+    // (77 bytes), so GCC's -Wformat-truncation has nothing to say under -Werror.
+    char text[80]{};
     std::snprintf(text, sizeof(text), "%04d-%02d-%02d %02d:%02d:%02d.%03d", parts.tm_year + 1900,
                   parts.tm_mon + 1, parts.tm_mday, parts.tm_hour, parts.tm_min, parts.tm_sec, millis);
     return std::string{text};

@@ -1,7 +1,7 @@
 """Workers and the command path: an early stop sticks, commands need a live link."""
 
 import threading
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 
@@ -73,6 +73,7 @@ def test_commands_need_a_connected_worker(monkeypatch):
 
 
 def test_reconnect_forgets_cpu_baselines_and_the_link():
+    forgotten = []
     window = link_window(
         _link_up=True,
         _prev={"svc": (1_000, 2_000)},
@@ -80,11 +81,46 @@ def test_reconnect_forgets_cpu_baselines_and_the_link():
         _stop_zmq_worker=lambda timeout_ms: None,
         _start_zmq_worker=lambda: None,
         _show_status=lambda text: None,
+        _forget_report=lambda: forgotten.append(True),
         sub_endpoint="tcp://host:6667",
         dealer_endpoint="tcp://host:5557",
+        report_endpoint="tcp://host:6668",
     )
     pmg.ProcessMonitorWindow._reconnect(window)
-    assert window._prev == {} and not window._link_up
+    assert window._prev == {} and not window._link_up and forgotten == [True]
+
+
+def test_a_report_fills_the_pages_and_the_gpu_source():
+    shown, greyed, details = [], [], []
+    window = SimpleNamespace(
+        _report=None,
+        _report_at=None,
+        _report_services={},
+        _report_state=None,
+        _stale=False,
+        _feed=pmg.FeedMonitor(),
+        service_page=SimpleNamespace(show_report=shown.append, set_report_stale=greyed.append),
+        _refresh_gpu_status=lambda: None,
+        _refresh_detail=lambda: details.append(True),
+    )
+    for name in ("_report_current", "_report_age_stale", "_details_for", "_manager_gpu", "_apply_report_state"):
+        setattr(window, name, MethodType(getattr(pmg.ProcessMonitorWindow, name), window))
+    report = {"gpuMonitoring": True, "services": [{"name": "svc", "gpuValid": True}]}
+    pmg.ProcessMonitorWindow._on_report(window, report)
+    assert shown == [report] and greyed == [False] and details
+    assert window._details_for("svc") == {"name": "svc", "gpuValid": True}
+    assert window._manager_gpu()
+
+    pmg.ProcessMonitorWindow._on_report(window, "not a report")  # ignored
+    assert shown == [report]
+
+    pmg.ProcessMonitorWindow._forget_report(window)
+    assert shown[-1] is None and window._details_for("svc") is None and not window._manager_gpu()
+
+
+def test_the_worker_reads_the_report_socket_only_when_asked():
+    assert pmg.ZmqWorker().report_endpoint == pmg.DEFAULT_REPORT_ENDPOINT
+    assert pmg.ZmqWorker(report_endpoint="").report_endpoint == ""
 
 
 def select_window(hidden):

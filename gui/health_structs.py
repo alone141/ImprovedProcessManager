@@ -32,8 +32,15 @@ struct CommandReply {
     char    Message[94];      // e.g. "started, pid 4242"
 };
 
-The full protocol, including the detailed report on port 6668, is described
-in docs/protocol.md at the top of the repository.
+=== Detailed report (ZMQ SUB, port 6668), sent by the C++ manager ===
+Multipart:
+  frame 0 : b"report"
+  frame 1 : ReportHeader (192 B) + ServiceRecord[] (368 B each) + GpuRecord[] (160 B each)
+The header carries its own size and the record sizes, so a reader skips
+fields a later manager appends (parse_detailed_report honours them).
+
+The full protocol is described in docs/protocol.md at the top of the
+repository; the report layout is manager/src/DetailedReport.cpp.
 """
 
 from __future__ import annotations
@@ -318,3 +325,442 @@ def make_command_reply(
     reply.ServiceName = _utf8_fit(service_name, 31)
     reply.Message = _utf8_fit(message, 93)
     return bytes(reply)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Detailed report (SUB, port 6668)
+# ──────────────────────────────────────────────────────────────────────────────
+
+REPORT_TOPIC = b"report"
+REPORT_MAGIC = 0x524D5042  # the bytes "BPMR"
+REPORT_VERSION = 1
+MAX_REPORT_RECORDS = 100_000  # the manager's own limit on either count
+
+
+class ServiceState(IntEnum):
+    """The manager's eight states; the health record folds them into RuntimeState."""
+    STOPPED   = 0
+    WAITING   = 1
+    STARTING  = 2
+    RUNNING   = 3
+    UNHEALTHY = 4
+    STOPPING  = 5
+    BACKOFF   = 6
+    FAILED    = 7
+
+    @classmethod
+    def from_byte(cls, value: int) -> "ServiceState":
+        try:
+            return cls(value)
+        except ValueError:
+            return cls.STOPPED  # the manager's own fallback when decoding
+
+
+# States with a live process.
+SERVICE_ALIVE_STATES = (
+    ServiceState.STARTING, ServiceState.RUNNING, ServiceState.UNHEALTHY, ServiceState.STOPPING,
+)
+
+
+class RestartMode(IntEnum):
+    NEVER      = 0
+    ON_FAILURE = 1
+    ALWAYS     = 2
+
+    @classmethod
+    def from_byte(cls, value: int) -> "RestartMode":
+        try:
+            return cls(value)
+        except ValueError:
+            return cls.NEVER
+
+
+RESTART_MODE_TEXT = {
+    RestartMode.NEVER: "never",
+    RestartMode.ON_FAILURE: "on-failure",
+    RestartMode.ALWAYS: "always",
+}
+
+# Service record flags (manager/include/DetailedReport.hpp).
+SERVICE_FLAG_AUTOSTART = 0x01
+SERVICE_FLAG_HEARTBEAT = 0x02
+SERVICE_FLAG_CGROUP    = 0x04
+SERVICE_FLAG_USAGE     = 0x08
+SERVICE_FLAG_GPU       = 0x10
+SERVICE_FLAG_REMOVING  = 0x20
+
+# Report header flags.
+REPORT_FLAG_CGROUPS  = 0x1
+REPORT_FLAG_GPU      = 0x2
+REPORT_FLAG_STOPPING = 0x4
+REPORT_FLAG_WINDOWS  = 0x8  # exit codes are Windows status codes, never minus a signal
+
+
+class ReportHeader(ctypes.LittleEndianStructure):
+    _pack_ = 1
+    _fields_ = [
+        ("magic",                ctypes.c_uint32),
+        ("version",              ctypes.c_uint16),
+        ("headerSize",           ctypes.c_uint16),
+        ("serviceRecordSize",    ctypes.c_uint16),
+        ("gpuRecordSize",        ctypes.c_uint16),
+        ("serviceCount",         ctypes.c_uint32),
+        ("gpuCount",             ctypes.c_uint32),
+        ("managerPid",           ctypes.c_int32),
+        ("snapshotTime",         ctypes.c_int64),   # ns
+        ("managerStartTime",     ctypes.c_int64),   # ns
+        ("publishIntervalMs",    ctypes.c_uint32),
+        ("flags",                ctypes.c_uint32),
+        ("hostCpuPercent",       ctypes.c_double),  # 0–100; negative = unknown
+        ("memoryTotalBytes",     ctypes.c_uint64),
+        ("memoryAvailableBytes", ctypes.c_uint64),
+        ("loadAverage1",         ctypes.c_double),
+        ("loadAverage5",         ctypes.c_double),
+        ("loadAverage15",        ctypes.c_double),
+        ("uptimeSeconds",        ctypes.c_uint64),
+        ("cpuCount",             ctypes.c_uint32),
+        ("reserved",             ctypes.c_uint32),
+        ("hostName",             ctypes.c_char * 64),
+        ("managerVersion",       ctypes.c_char * 16),
+    ]
+
+
+class ServiceRecord(ctypes.LittleEndianStructure):
+    _pack_ = 1
+    _fields_ = [
+        ("name",             ctypes.c_char * 32),
+        ("binary",           ctypes.c_char * 128),
+        ("description",      ctypes.c_char * 64),
+        ("pid",              ctypes.c_int32),
+        ("state",            ctypes.c_uint8),    # ServiceState
+        ("restartMode",      ctypes.c_uint8),    # RestartMode
+        ("flags",            ctypes.c_uint8),    # SERVICE_FLAG_*
+        ("reserved",         ctypes.c_uint8),
+        ("restartCount",     ctypes.c_int32),
+        ("missedBeats",      ctypes.c_int32),
+        ("lastExitCode",     ctypes.c_int32),    # exit code, or minus the signal number
+        ("processCount",     ctypes.c_int32),
+        ("threadCount",      ctypes.c_int32),
+        ("openFiles",        ctypes.c_int32),    # -1 = unknown
+        ("startTime",        ctypes.c_int64),    # ns; 0 = never started
+        ("lastSeen",         ctypes.c_int64),    # ns
+        ("lastExitTime",     ctypes.c_int64),    # ns; 0 = never exited
+        ("nextRestartTime",  ctypes.c_int64),    # ns; 0 = none scheduled
+        ("cpuTimeUsec",      ctypes.c_uint64),
+        ("cpuPercent",       ctypes.c_double),   # 100 = one busy core; negative = unknown
+        ("memoryBytes",      ctypes.c_uint64),
+        ("memoryPeakBytes",  ctypes.c_uint64),
+        ("memoryLimitBytes", ctypes.c_uint64),   # 0 = none
+        ("ioReadBytes",      ctypes.c_uint64),
+        ("ioWriteBytes",     ctypes.c_uint64),
+        ("gpuPercent",       ctypes.c_double),   # summed over GPUs; negative = unknown
+        ("gpuMemoryBytes",   ctypes.c_uint64),
+        ("oomKills",         ctypes.c_uint32),
+        ("cpuLimitPercent",  ctypes.c_uint32),   # 0 = none
+    ]
+
+
+class GpuRecord(ctypes.LittleEndianStructure):
+    _pack_ = 1
+    _fields_ = [
+        ("name",                     ctypes.c_char * 64),
+        ("uuid",                     ctypes.c_char * 48),
+        ("index",                    ctypes.c_uint32),
+        ("temperatureC",             ctypes.c_uint32),  # 0 = unknown
+        ("utilizationPercent",       ctypes.c_double),
+        ("memoryUtilizationPercent", ctypes.c_double),
+        ("memoryTotalBytes",         ctypes.c_uint64),
+        ("memoryUsedBytes",          ctypes.c_uint64),
+        ("powerMilliwatts",          ctypes.c_uint32),
+        ("reserved",                 ctypes.c_uint32),
+    ]
+
+
+REPORT_HEADER_SIZE = ctypes.sizeof(ReportHeader)
+SERVICE_RECORD_SIZE = ctypes.sizeof(ServiceRecord)
+GPU_RECORD_SIZE = ctypes.sizeof(GpuRecord)
+assert REPORT_HEADER_SIZE == 192, f"Unexpected REPORT_HEADER_SIZE={REPORT_HEADER_SIZE}"
+assert SERVICE_RECORD_SIZE == 368, f"Unexpected SERVICE_RECORD_SIZE={SERVICE_RECORD_SIZE}"
+assert GPU_RECORD_SIZE == 160, f"Unexpected GPU_RECORD_SIZE={GPU_RECORD_SIZE}"
+
+
+def _text(raw: bytes) -> str:
+    return raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+
+
+def _unknown_if_negative(value: float) -> Optional[float]:
+    return None if value < 0 else float(value)
+
+
+def service_record_to_dict(record: ServiceRecord) -> dict:
+    flags = int(record.flags)
+    return {
+        "name":             _text(record.name),
+        "binary":           _text(record.binary),
+        "description":      _text(record.description),
+        "pid":              int(record.pid),
+        "state":            ServiceState.from_byte(record.state),
+        "restartMode":      RestartMode.from_byte(record.restartMode),
+        "flags":            flags,
+        "autostart":        bool(flags & SERVICE_FLAG_AUTOSTART),
+        "heartbeat":        bool(flags & SERVICE_FLAG_HEARTBEAT),
+        "cgroup":           bool(flags & SERVICE_FLAG_CGROUP),
+        "usageValid":       bool(flags & SERVICE_FLAG_USAGE),
+        "gpuValid":         bool(flags & SERVICE_FLAG_GPU),
+        "removing":         bool(flags & SERVICE_FLAG_REMOVING),
+        "restartCount":     int(record.restartCount),
+        "missedBeats":      int(record.missedBeats),
+        "lastExitCode":     int(record.lastExitCode),
+        "processCount":     int(record.processCount),
+        "threadCount":      int(record.threadCount),
+        "openFiles":        None if record.openFiles < 0 else int(record.openFiles),
+        "startTime":        int(record.startTime),
+        "lastSeen":         int(record.lastSeen),
+        "lastExitTime":     int(record.lastExitTime),
+        "nextRestartTime":  int(record.nextRestartTime),
+        "cpuTimeUsec":      int(record.cpuTimeUsec),
+        "cpuPercent":       _unknown_if_negative(record.cpuPercent),
+        "memoryBytes":      int(record.memoryBytes),
+        "memoryPeakBytes":  int(record.memoryPeakBytes),
+        "memoryLimitBytes": int(record.memoryLimitBytes),
+        "ioReadBytes":      int(record.ioReadBytes),
+        "ioWriteBytes":     int(record.ioWriteBytes),
+        "gpuPercent":       _unknown_if_negative(record.gpuPercent),
+        "gpuMemoryBytes":   int(record.gpuMemoryBytes),
+        "oomKills":         int(record.oomKills),
+        "cpuLimitPercent":  int(record.cpuLimitPercent),
+    }
+
+
+def gpu_record_to_dict(record: GpuRecord) -> dict:
+    return {
+        "name":                     _text(record.name),
+        "uuid":                     _text(record.uuid),
+        "index":                    int(record.index),
+        "temperatureC":             int(record.temperatureC),
+        "utilizationPercent":       _unknown_if_negative(record.utilizationPercent),
+        "memoryUtilizationPercent": _unknown_if_negative(record.memoryUtilizationPercent),
+        "memoryTotalBytes":         int(record.memoryTotalBytes),
+        "memoryUsedBytes":          int(record.memoryUsedBytes),
+        "powerMilliwatts":          int(record.powerMilliwatts),
+    }
+
+
+def parse_detailed_report(payload: bytes) -> dict:
+    """Decode the payload frame that follows the ``report`` topic.
+
+    The sizes in the header win over this module's: a newer manager that
+    appends fields still parses, and its extra bytes are skipped.
+    Raises ValueError for anything that is not a version-1 report.
+    """
+    if len(payload) < REPORT_HEADER_SIZE:
+        raise ValueError(f"report payload too short: {len(payload)} bytes, header is {REPORT_HEADER_SIZE}")
+    header = ReportHeader.from_buffer_copy(payload)
+    if header.magic != REPORT_MAGIC:
+        raise ValueError(f"not a report: magic 0x{int(header.magic):08X}, expected 0x{REPORT_MAGIC:08X}")
+    if header.version != REPORT_VERSION:
+        raise ValueError(f"report version {int(header.version)}, this reader knows {REPORT_VERSION}")
+    header_size = int(header.headerSize)
+    record_size = int(header.serviceRecordSize)
+    gpu_size = int(header.gpuRecordSize)
+    if header_size < REPORT_HEADER_SIZE or record_size < SERVICE_RECORD_SIZE or gpu_size < GPU_RECORD_SIZE:
+        raise ValueError(
+            f"report layout too small: header {header_size}, service {record_size}, gpu {gpu_size}"
+        )
+    service_count = int(header.serviceCount)
+    gpu_count = int(header.gpuCount)
+    if service_count > MAX_REPORT_RECORDS or gpu_count > MAX_REPORT_RECORDS:
+        raise ValueError(f"report counts out of range: {service_count} services, {gpu_count} GPUs")
+    expected = header_size + service_count * record_size + gpu_count * gpu_size
+    if len(payload) != expected:
+        raise ValueError(f"report payload is {len(payload)} bytes, the header announces {expected}")
+
+    offset = header_size
+    services = []
+    for _ in range(service_count):
+        services.append(service_record_to_dict(ServiceRecord.from_buffer_copy(payload, offset)))
+        offset += record_size
+    gpus = []
+    for _ in range(gpu_count):
+        gpus.append(gpu_record_to_dict(GpuRecord.from_buffer_copy(payload, offset)))
+        offset += gpu_size
+
+    flags = int(header.flags)
+    return {
+        "managerPid":           int(header.managerPid),
+        "snapshotTime":         int(header.snapshotTime),
+        "managerStartTime":     int(header.managerStartTime),
+        "publishIntervalMs":    int(header.publishIntervalMs),
+        "flags":                flags,
+        "cgroups":              bool(flags & REPORT_FLAG_CGROUPS),
+        "gpuMonitoring":        bool(flags & REPORT_FLAG_GPU),
+        "stopping":             bool(flags & REPORT_FLAG_STOPPING),
+        "windows":              bool(flags & REPORT_FLAG_WINDOWS),
+        "hostCpuPercent":       _unknown_if_negative(header.hostCpuPercent),
+        "memoryTotalBytes":     int(header.memoryTotalBytes),
+        "memoryAvailableBytes": int(header.memoryAvailableBytes),
+        "loadAverage":          (float(header.loadAverage1), float(header.loadAverage5), float(header.loadAverage15)),
+        "uptimeSeconds":        int(header.uptimeSeconds),
+        "cpuCount":             int(header.cpuCount),
+        "hostName":             _text(header.hostName),
+        "managerVersion":       _text(header.managerVersion),
+        "services":             services,
+        "gpus":                 gpus,
+    }
+
+
+def parse_report_frames(frames) -> Optional[dict]:
+    """The report in a SUB message (``report`` + payload), or None for another topic.
+    A payload that is not a report raises ValueError."""
+    parts = [bytes(f) for f in frames]
+    if len(parts) != 2 or parts[0] != REPORT_TOPIC:
+        return None
+    return parse_detailed_report(parts[1])
+
+
+def _flags_from(source: dict, table) -> int:
+    """``flags`` when the dict has it, otherwise composed from the booleans in ``table``."""
+    if "flags" in source:
+        return int(source["flags"])
+    flags = 0
+    for key, bit in table:
+        if source.get(key):
+            flags |= bit
+    return flags
+
+
+_SERVICE_FLAG_KEYS = (
+    ("autostart", SERVICE_FLAG_AUTOSTART), ("heartbeat", SERVICE_FLAG_HEARTBEAT),
+    ("cgroup", SERVICE_FLAG_CGROUP), ("usageValid", SERVICE_FLAG_USAGE),
+    ("gpuValid", SERVICE_FLAG_GPU), ("removing", SERVICE_FLAG_REMOVING),
+)
+_REPORT_FLAG_KEYS = (
+    ("cgroups", REPORT_FLAG_CGROUPS), ("gpuMonitoring", REPORT_FLAG_GPU),
+    ("stopping", REPORT_FLAG_STOPPING), ("windows", REPORT_FLAG_WINDOWS),
+)
+
+
+def _optional(value, unknown):
+    return unknown if value is None else value
+
+
+def encode_detailed_report(report: dict) -> bytes:
+    """Build the payload frame the way the C++ manager does, from the dict
+    shape parse_detailed_report returns (missing keys take their zero value).
+    The mock publisher and the tests use it."""
+    services = report.get("services", [])
+    gpus = report.get("gpus", [])
+    header = ReportHeader()
+    header.magic = REPORT_MAGIC
+    header.version = REPORT_VERSION
+    header.headerSize = REPORT_HEADER_SIZE
+    header.serviceRecordSize = SERVICE_RECORD_SIZE
+    header.gpuRecordSize = GPU_RECORD_SIZE
+    header.serviceCount = len(services)
+    header.gpuCount = len(gpus)
+    header.managerPid = int(report.get("managerPid", 0))
+    header.snapshotTime = int(report.get("snapshotTime", 0))
+    header.managerStartTime = int(report.get("managerStartTime", 0))
+    header.publishIntervalMs = int(report.get("publishIntervalMs", 0))
+    header.flags = _flags_from(report, _REPORT_FLAG_KEYS)
+    header.hostCpuPercent = float(_optional(report.get("hostCpuPercent"), -1.0))
+    header.memoryTotalBytes = int(report.get("memoryTotalBytes", 0))
+    header.memoryAvailableBytes = int(report.get("memoryAvailableBytes", 0))
+    load = report.get("loadAverage", (0.0, 0.0, 0.0))
+    header.loadAverage1, header.loadAverage5, header.loadAverage15 = (float(v) for v in load)
+    header.uptimeSeconds = int(report.get("uptimeSeconds", 0))
+    header.cpuCount = int(report.get("cpuCount", 0))
+    header.hostName = _utf8_fit(report.get("hostName", ""), 63)
+    header.managerVersion = _utf8_fit(report.get("managerVersion", ""), 15)
+
+    parts = [bytes(header)]
+    for service in services:
+        record = ServiceRecord()
+        record.name = _utf8_fit(service.get("name", ""), 31)
+        record.binary = _utf8_fit(service.get("binary", ""), 127)
+        record.description = _utf8_fit(service.get("description", ""), 63)
+        record.pid = int(service.get("pid", 0))
+        record.state = int(service.get("state", ServiceState.STOPPED))
+        record.restartMode = int(service.get("restartMode", RestartMode.NEVER))
+        record.flags = _flags_from(service, _SERVICE_FLAG_KEYS)
+        record.restartCount = int(service.get("restartCount", 0))
+        record.missedBeats = int(service.get("missedBeats", 0))
+        record.lastExitCode = int(service.get("lastExitCode", 0))
+        record.processCount = int(service.get("processCount", 0))
+        record.threadCount = int(service.get("threadCount", 0))
+        record.openFiles = int(_optional(service.get("openFiles"), -1))
+        record.startTime = int(service.get("startTime", 0))
+        record.lastSeen = int(service.get("lastSeen", 0))
+        record.lastExitTime = int(service.get("lastExitTime", 0))
+        record.nextRestartTime = int(service.get("nextRestartTime", 0))
+        record.cpuTimeUsec = int(service.get("cpuTimeUsec", 0))
+        record.cpuPercent = float(_optional(service.get("cpuPercent"), -1.0))
+        record.memoryBytes = int(service.get("memoryBytes", 0))
+        record.memoryPeakBytes = int(service.get("memoryPeakBytes", 0))
+        record.memoryLimitBytes = int(service.get("memoryLimitBytes", 0))
+        record.ioReadBytes = int(service.get("ioReadBytes", 0))
+        record.ioWriteBytes = int(service.get("ioWriteBytes", 0))
+        record.gpuPercent = float(_optional(service.get("gpuPercent"), -1.0))
+        record.gpuMemoryBytes = int(service.get("gpuMemoryBytes", 0))
+        record.oomKills = int(service.get("oomKills", 0))
+        record.cpuLimitPercent = int(service.get("cpuLimitPercent", 0))
+        parts.append(bytes(record))
+    for gpu in gpus:
+        record = GpuRecord()
+        record.name = _utf8_fit(gpu.get("name", ""), 63)
+        record.uuid = _utf8_fit(gpu.get("uuid", ""), 47)
+        record.index = int(gpu.get("index", 0))
+        record.temperatureC = int(gpu.get("temperatureC", 0))
+        record.utilizationPercent = float(_optional(gpu.get("utilizationPercent"), -1.0))
+        record.memoryUtilizationPercent = float(_optional(gpu.get("memoryUtilizationPercent"), -1.0))
+        record.memoryTotalBytes = int(gpu.get("memoryTotalBytes", 0))
+        record.memoryUsedBytes = int(gpu.get("memoryUsedBytes", 0))
+        record.powerMilliwatts = int(gpu.get("powerMilliwatts", 0))
+        parts.append(bytes(record))
+    return b"".join(parts)
+
+
+# The names the manager prints (manager/src/ProcessLauncher.cpp, SignalName).
+SIGNAL_NAMES = {
+    1: "HUP", 2: "INT", 3: "QUIT", 4: "ILL", 6: "ABRT", 7: "BUS", 8: "FPE",
+    9: "KILL", 11: "SEGV", 13: "PIPE", 14: "ALRM", 15: "TERM",
+}
+MAX_SIGNAL_NUMBER = 64
+
+
+def exit_text(code: int, windows: bool = False) -> str:
+    """The manager's wording for a last exit: ``exit 3``, ``signal 9 (KILL)``,
+    or ``exit 0xC0000005`` for a Windows status code."""
+    if code >= 0:
+        return f"exit {code}"
+    if not windows and -code <= MAX_SIGNAL_NUMBER:
+        name = SIGNAL_NAMES.get(-code)
+        return f"signal {-code}" + (f" ({name})" if name else "")
+    return f"exit 0x{code & 0xFFFFFFFF:08X}"
+
+
+def format_duration_short(ns: int) -> str:
+    """The CLI's coarse duration: ``11s``, ``3m 05s``, ``2h 07m``, ``3d 04h``."""
+    seconds = int(max(ns, 0) // 1_000_000_000)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    if seconds < 86400:
+        return f"{seconds // 3600}h {(seconds // 60) % 60:02d}m"
+    return f"{seconds // 86400}d {(seconds // 3600) % 24:02d}h"
+
+
+def service_state_text(service: dict, snapshot_ns: int) -> str:
+    """The state the CLI prints: ``backoff 2s``, ``running (2 missed)``, ``failed``."""
+    state: ServiceState = service["state"]
+    text = state.name.lower()
+    next_restart = int(service.get("nextRestartTime", 0) or 0)
+    if state == ServiceState.BACKOFF and next_restart > snapshot_ns:
+        text += " " + format_duration_short(next_restart - snapshot_ns)
+    missed = int(service.get("missedBeats", 0) or 0)
+    if missed > 0 and state in SERVICE_ALIVE_STATES:
+        text += f" ({missed} missed)"
+    if service.get("removing"):
+        text += " (removing)"
+    return text

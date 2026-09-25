@@ -7,12 +7,12 @@ Two programs that talk over ZeroMQ:
 | Directory | Program | Built with |
 |-----------|---------|------------|
 | [`manager/`](manager/) | `berayprocessmanager`: starts the services listed in a configuration file, restarts them by policy, measures CPU, memory, I/O and GPU use, and publishes it all. The same binary is the command-line client (`--status`, `--start`, `--stop`, `--restart`). | C++20, CMake |
-| [`gui/`](gui/) | The health monitor: one window with every service, its graphs, cgroup processes and journal, and Start / Stop / Restart buttons. | Python 3, PyQt6 |
+| [`gui/`](gui/) | The health monitor: one window with every service, its figures and details from the manager, graphs, cgroup processes and journal, a host overview, and Start / Stop / Restart buttons. | Python 3, PyQt6 |
 
 The contract between them is [`docs/protocol.md`](docs/protocol.md). The manager
 keeps the GUI's original interface (a 128-byte health record per service on
 port 6667, commands on 5557) and adds a detailed report on port 6668, replies to
-commands, heartbeats and reload.
+commands, heartbeats and reload. The GUI reads both reports.
 
 ```text
  berayprocessmanager                          GUI (gui/process_monitor_gui.py)
@@ -22,8 +22,8 @@ commands, heartbeats and reload.
  │                          │                 │                              │
  │ ROUTER 5557              │ ◀────────────── │ Start / Stop / Restart       │
  │                          │   DEALER "PMC"  └──────────────────────────────┘
- │ PUB 6668 (detailed)      │ ──────────────▶  berayprocessmanager --status
- └──────────────────────────┘                  (same binary, client mode)
+ │ PUB 6668 (detailed)      │ ──────────────▶  the GUI's details and host overview,
+ └──────────────────────────┘                  berayprocessmanager --status (client mode)
 ```
 
 ## Quick start (one Linux host)

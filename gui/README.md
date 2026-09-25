@@ -6,11 +6,12 @@ A GUI for monitoring and controlling services run by a central process manager o
 
 - **Real-time monitoring** via PUB-SUB (data broadcast from your process manager). The toolbar pill shows whether reports are actually arriving (`Live`, `Waiting for data…`, `No data for 12s`); when they stop, the last values are greyed out
 - **Master-detail layout** — the sidebar lists `berayprocessmanager` and every reported process (state dot, live CPU % or a missed-beats badge; type in the filter box to narrow it). The pane on the right shows the selection
-- **Process page** — state pill, **Start / Stop / Restart** (DEALER socket, talks to the manager's ROUTER; the manager's reply, such as `restart vision: ok (restarting)` or `start ghost: unknown service`, appears in the status bar), PID / uptime / heartbeat age, six metric tiles (CPU %, memory, **GPU %** and **VRAM** from local nvidia-smi joined by PID, missed beats, restarts) and a **state band** over the last 15 minutes
+- **Detailed report** — the GUI also subscribes to the manager's report on port 6668: per-service GPU figures measured on the manager's host, threads, open files, I/O, exit codes, limits, and the host's own CPU, memory, load and GPUs. Without it (an older manager, or the port out of reach) everything else works as before and the pages say so
+- **Process page** — state pill, **Start / Stop / Restart** (DEALER socket, talks to the manager's ROUTER; the manager's reply, such as `restart vision: ok (restarting)` or `start ghost: unknown service`, appears in the status bar), PID / uptime / heartbeat age, six metric tiles (CPU %, memory, **GPU %** and **VRAM** from the manager's report, or from local nvidia-smi joined by PID without it, missed beats, restarts), a **Details** panel from the report (the manager's own state, binary, restart policy, last exit, next restart, threads, open files, I/O, peak memory, limits, accounting, heartbeat) and a **state band** over the last 15 minutes
 - **Graphs tab** — CPU %, memory, GPU % and VRAM for the selected process over the last 1/5/15 minutes; hover to read values, tick other processes under *Compare* to overlay them, *Pop out* opens the graphs in their own window. Recording starts with the GUI (one sample a second, 15 minutes kept), so the recent past is there when you look
 - **cgroup PIDs tab** — the PIDs in `task_<name>/cgroup.procs` with comm, RSS and command line; double-click one for its `journalctl _PID=` window
 - **Journal tab** — live `journalctl _SYSTEMD_CGROUP=…/task_<name>`, lines coloured by PID
-- **Manager page** (select `berayprocessmanager`) — live `systemctl status` + journal for `berayprocessmanager.service` (Linux)
+- **Manager page** (select `berayprocessmanager`) — a **host overview** from the detailed report (host name, manager version, PID and uptime, host CPU, memory, load, GPUs, services by state; every platform), then live `systemctl status` + journal for `berayprocessmanager.service` (Linux)
 - Thread-safe ZMQ handling (never blocks the GUI)
 - Dark Fusion theme; sizes follow the system font and display scaling
 
@@ -20,13 +21,17 @@ A GUI for monitoring and controlling services run by a central process manager o
 pip install -r requirements.txt
 ```
 
-Packages: PyQt6, pyzmq only. GPU tiles use **local nvidia-smi** (must be on PATH); no Python GPU package. The GUI works without a GPU.
+Packages: PyQt6, pyzmq only. GPU tiles use the manager's figures, or **local nvidia-smi** (on PATH) without them; no Python GPU package. The GUI works without a GPU.
 
 ## GPU tiles
 
-The GUI samples **local** NVIDIA GPU usage via **nvidia-smi** and joins by **PID** from health reports. VRAM comes from compute apps (CUDA processes in v1). GPU % is shown when `pmon` provides it; otherwise the tile shows "—". Multi-GPU usage is summed per process. If nvidia-smi is unavailable, the GPU tiles show "—" and the toolbar pill reads `GPU unavailable`.
+The manager measures GPU use itself (NVML on its host, summed over each service's processes) and publishes it in the detailed report. While that report arrives, the tiles and the graphs use it and the toolbar pill reads `GPU · manager`; this is the only source that is right when the GUI runs on another machine.
+
+Without it, the GUI samples **local** NVIDIA GPU usage via **nvidia-smi** and joins by **PID** from health reports (pill `GPU · nvidia-smi`). VRAM comes from compute apps (CUDA processes in v1). GPU % is shown when `pmon` provides it; otherwise the tile shows "—". Multi-GPU usage is summed per process. With neither source, the GPU tiles show "—" and the pill reads `GPU unavailable`.
 
 ## Manager page
+
+The page opens with a **host overview** from the detailed report: host name, manager version, PID and uptime, publish interval, cgroup and GPU monitoring, host CPU %, memory used of total, load averages, host uptime, the services by state and one line per GPU (utilisation, memory, temperature, power). It works on every platform, also where there is no systemd to ask; until the first report it says it is waiting.
 
 On Linux hosts with systemd, the manager page (first sidebar entry) auto-refreshes every 2s:
 
@@ -57,10 +62,11 @@ python process_monitor_gui.py
 # Or override endpoints explicitly:
 python process_monitor_gui.py \
     --sub tcp://127.0.0.1:6667 \
+    --report tcp://127.0.0.1:6668 \
     --dealer tcp://127.0.0.1:5557
 ```
 
-GUI flags: `--sub` (health SUB), `--dealer` (command DEALER). Mock binds with `--pub` / `--router` (see `mock_publisher.py --help`).
+GUI flags: `--sub` (health SUB), `--report` (detailed report SUB), `--dealer` (command DEALER). Mock binds with `--pub` / `--report` / `--router` (see `mock_publisher.py --help`).
 
 ## Standalone executable (nothing to install on the target)
 
@@ -78,7 +84,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_executable.ps1
 # -> dist\ProcessMonitor-windows-x64.zip
 ```
 
-On the target: unpack and run `ProcessMonitor/ProcessMonitor --sub tcp://HOST:6667 --dealer tcp://HOST:5557` (or `ProcessMonitor.exe` on Windows).
+On the target: unpack and run `ProcessMonitor/ProcessMonitor --sub tcp://HOST:6667 --report tcp://HOST:6668 --dealer tcp://HOST:5557` (or `ProcessMonitor.exe` on Windows).
 
 Rules of thumb:
 
@@ -95,38 +101,38 @@ Rules of thumb:
 ```
 ┌──────────────────────────┐   health, PUB → SUB, 6667   ┌──────────────────────┐
 │   berayprocessmanager    │ ──────────────────────────▶ │   PyQt6 GUI (this)   │
-│   (../manager, C++)      │                             │                      │
-│                          │   commands, DEALER "PMC"    │  • sidebar, tiles,   │
-│  • runs the services     │ ◀────────────────────────── │    graphs, journal   │
-│  • restarts, measures    │   replies, ROUTER → DEALER  │  • Start/Stop/Restart│
-│  • publishes reports     │ ──────────────────────────▶ └──────────────────────┘
-└──────────────────────────┘
+│   (../manager, C++)      │   report, PUB → SUB, 6668   │                      │
+│                          │ ──────────────────────────▶ │  • sidebar, tiles,   │
+│  • runs the services     │   commands, DEALER "PMC"    │    details, graphs,  │
+│  • restarts, measures    │ ◀────────────────────────── │    journal, host     │
+│  • publishes reports     │   replies, ROUTER → DEALER  │  • Start/Stop/Restart│
+└──────────────────────────┘ ──────────────────────────▶ └──────────────────────┘
 ```
 
 The GUI reads the simplified health report (one 128-byte record per service)
-and sends `CommandMessage`s. The manager also publishes a detailed report on
-port 6668 (per-service GPU, threads, open files, I/O, exit codes, host figures),
-which `berayprocessmanager --status` shows; the GUI does not read it yet.
+and the detailed report on port 6668 (per-service GPU, threads, open files,
+I/O, exit codes, host figures: the same report `berayprocessmanager --status`
+shows), and sends `CommandMessage`s.
 
 ## Protocol
 
 `health_structs.py` holds the binary structs: `DetailedHealthReport` (the
 128-byte health record; the name is historical), `CommandMessage` (65 bytes,
-sent after the frame `BPM` with identity `PMC`) and `CommandReply` (128 bytes,
-the manager's answer). The complete description, including the detailed report
-and heartbeats, is [`../docs/protocol.md`](../docs/protocol.md).
-`mock_publisher.py` speaks the same protocol for testing without the manager.
+sent after the frame `BPM` with identity `PMC`), `CommandReply` (128 bytes,
+the manager's answer) and the detailed report's `ReportHeader`, `ServiceRecord`
+and `GpuRecord`, read by the sizes the header states so that a newer manager's
+appended fields are skipped. The complete description, including heartbeats,
+is [`../docs/protocol.md`](../docs/protocol.md). `mock_publisher.py` speaks the
+same protocol, both reports included, for testing without the manager.
 
 ## Ports
 
-Health `6667` (SUB), commands `5557` (DEALER); the manager's detailed report is
-on `6668`. The GUI takes `--sub` and `--dealer`; the mock takes `--pub` and
-`--router`.
+Health `6667` (SUB), detailed report `6668` (SUB, topic `report`), commands
+`5557` (DEALER). The GUI takes `--sub`, `--report` and `--dealer`; the mock
+takes `--pub`, `--report` and `--router`.
 
 ## Next Steps
 
-- Read the detailed report (port 6668) for GPU figures measured on the manager's
-  host, so the GPU tiles work when the GUI runs elsewhere
 - Offer the manager's `*` target ("start all" / "stop all") and `--reload`
 - Add authentication/encryption if needed (ZMQ CURVE)
 - Persist last used addresses in QSettings
@@ -140,8 +146,8 @@ on `6668`. The GUI takes `--sub` and `--dealer`; the mock takes `--pub` and
 - `ui_scale.py` – Font- and display-relative sizing
 - `systemd_logs.py` – systemctl / journalctl / cgroup helpers
 - `gpu_sampler.py` – Local nvidia-smi sampling by PID
-- `health_structs.py` – Binary health, command and reply structs
-- `mock_publisher.py` – Mock process manager for testing
+- `health_structs.py` – Binary health, command, reply and detailed report structs
+- `mock_publisher.py` – Mock process manager (both reports, command replies) for testing
 - `ProcessMonitor.spec`, `scripts/` – Standalone executable build
 - `tests/` – pytest suite (`python -m pytest` from this directory)
 - `requirements.txt` – Python dependencies

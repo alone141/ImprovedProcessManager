@@ -53,7 +53,17 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from health_structs import CommandEnum, RuntimeState, format_bytes, format_duration_ns
+from health_structs import (
+    RESTART_MODE_TEXT,
+    CommandEnum,
+    RuntimeState,
+    ServiceState,
+    exit_text,
+    format_bytes,
+    format_duration_ns,
+    format_duration_short,
+    service_state_text,
+)
 from journal_view import JournalView
 from systemd_logs import SERVICE_UNIT, task_cgroup_name
 from ui_scale import MONO_FONT_FAMILIES, ui_font, ui_point_size
@@ -276,6 +286,179 @@ def service_active_text(status_text: str) -> str:
     """The unit's active state ("active", "failed", …) from systemctl status."""
     match = re.search(r"^\s*Active:\s*(\S+)", status_text or "", re.MULTILINE)
     return match.group(1) if match else ""
+
+
+# ── the detailed report, as text ─────────────────────────────────────────────
+
+NO_REPORT_TEXT = (
+    "No detailed report from the manager (port 6668): the tiles show the health record only"
+)
+WAITING_REPORT_TEXT = "Waiting for the manager's detailed report (port 6668)…"
+
+# Rows of the process page's details panel, in display order. A value the
+# report does not have hides its row.
+DETAIL_ROWS = (
+    ("state", "Manager state"),
+    ("binary", "Binary"),
+    ("description", "Description"),
+    ("restart", "Restart policy"),
+    ("exit", "Last exit"),
+    ("next", "Next restart"),
+    ("procs", "Processes · threads · files"),
+    ("io", "I/O"),
+    ("peak", "Peak memory"),
+    ("limits", "Limits"),
+    ("accounting", "Accounting"),
+    ("heartbeat", "Heartbeat"),
+    ("gpu", "GPU (manager)"),
+)
+
+# Rows of the manager page's host overview.
+HOST_ROWS = (
+    ("host", "Host"),
+    ("manager", "Manager"),
+    ("publish", "Publishing"),
+    ("accounting", "Accounting"),
+    ("cpu", "CPU"),
+    ("memory", "Memory"),
+    ("load", "Load"),
+    ("uptime", "Host uptime"),
+    ("services", "Services"),
+    ("gpus", "GPUs"),
+)
+
+
+def ago_text(snapshot_ns: int, when_ns: int) -> str:
+    return format_duration_short(snapshot_ns - when_ns) + " ago"
+
+
+def details_values(record: dict, report: dict) -> Dict[str, str]:
+    """The details panel's rows for one service record of the detailed report."""
+    snapshot = int(report.get("snapshotTime", 0) or 0)
+    windows = bool(report.get("windows"))
+    values: Dict[str, str] = {"state": service_state_text(record, snapshot)}
+    values["binary"] = record.get("binary") or "—"
+    if record.get("description"):
+        values["description"] = record["description"]
+    policy = RESTART_MODE_TEXT.get(record.get("restartMode"), "—")
+    values["restart"] = policy + (" · autostart" if record.get("autostart") else "")
+    exit_time = int(record.get("lastExitTime", 0) or 0)
+    if exit_time:
+        values["exit"] = f"{exit_text(int(record.get('lastExitCode', 0)), windows)}, {ago_text(snapshot, exit_time)}"
+    else:
+        values["exit"] = "never"
+    next_restart = int(record.get("nextRestartTime", 0) or 0)
+    if next_restart > snapshot:
+        values["next"] = "in " + format_duration_short(next_restart - snapshot)
+    if record.get("usageValid"):
+        files = record.get("openFiles")
+        values["procs"] = (
+            f"{record.get('processCount', 0)} · {record.get('threadCount', 0)} · "
+            f"{'—' if files is None else files}"
+        )
+        values["io"] = (
+            f"read {format_bytes(int(record.get('ioReadBytes', 0)))} · "
+            f"written {format_bytes(int(record.get('ioWriteBytes', 0)))}"
+        )
+        values["peak"] = format_bytes(int(record.get("memoryPeakBytes", 0)))
+    limits = []
+    if record.get("memoryLimitBytes"):
+        limits.append("memory " + format_bytes(int(record["memoryLimitBytes"])))
+    if record.get("cpuLimitPercent"):
+        limits.append(f"CPU {record['cpuLimitPercent']} % of one core")
+    values["limits"] = " · ".join(limits) if limits else "none"
+    if record.get("cgroup"):
+        accounting = "cgroup " + task_cgroup_name(record.get("name", ""))
+        if record.get("oomKills"):
+            accounting += f" · {record['oomKills']} OOM kills"
+        values["accounting"] = accounting
+    else:
+        values["accounting"] = "session and descendants"
+    if record.get("heartbeat"):
+        beat = "supervised"
+        last_seen = int(record.get("lastSeen", 0) or 0)
+        if last_seen and record.get("state") in (ServiceState.RUNNING, ServiceState.UNHEALTHY):
+            beat += " · last beat " + ago_text(snapshot, last_seen)
+        if record.get("missedBeats"):
+            beat += f" · {record['missedBeats']} missed"
+        values["heartbeat"] = beat
+    else:
+        values["heartbeat"] = "not supervised"
+    if record.get("gpuValid"):
+        gpu = record.get("gpuPercent")
+        values["gpu"] = (
+            ("—" if gpu is None else f"{gpu:.1f} %")
+            + " · " + format_bytes(int(record.get("gpuMemoryBytes", 0)))
+        )
+    elif report.get("gpuMonitoring"):
+        values["gpu"] = "no GPU figures for this service"
+    return values
+
+
+def host_values(report: dict) -> Dict[str, str]:
+    """The host overview's rows for a detailed report's header and GPU records."""
+    snapshot = int(report.get("snapshotTime", 0) or 0)
+    values: Dict[str, str] = {"host": report.get("hostName") or "?"}
+    manager = f"v{report.get('managerVersion') or '?'} · PID {report.get('managerPid', 0)}"
+    started = int(report.get("managerStartTime", 0) or 0)
+    if started:
+        manager += " · up " + format_duration_short(snapshot - started)
+    if report.get("stopping"):
+        manager += " · shutting down"
+    values["manager"] = manager
+    interval = int(report.get("publishIntervalMs", 0) or 0)
+    values["publish"] = (
+        (f"every {interval / 1000:.1f} s" if interval else "interval unknown")
+        + f" · snapshot {snapshot_clock(snapshot)}"
+    )
+    accounting = "cgroups" if report.get("cgroups") else "sessions (no cgroups)"
+    accounting += " · GPU monitoring (NVML)" if report.get("gpuMonitoring") else " · no GPU monitoring"
+    if report.get("windows"):
+        accounting += " · Windows host"
+    values["accounting"] = accounting
+    cpu = report.get("hostCpuPercent")
+    cores = int(report.get("cpuCount", 0) or 0)
+    values["cpu"] = ("—" if cpu is None else f"{cpu:.1f} %") + (f" of {cores} cores" if cores else "")
+    total = int(report.get("memoryTotalBytes", 0) or 0)
+    available = int(report.get("memoryAvailableBytes", 0) or 0)
+    used = total - available if total > available else 0
+    values["memory"] = f"{format_bytes(used)} used of {format_bytes(total)}" if total else "—"
+    load = tuple(report.get("loadAverage") or ())
+    if len(load) == 3 and (any(load) or not report.get("windows")):
+        values["load"] = " ".join(f"{value:.2f}" for value in load)
+    uptime = int(report.get("uptimeSeconds", 0) or 0)
+    if uptime:
+        values["uptime"] = format_duration_short(uptime * 1_000_000_000)
+    services = report.get("services") or []
+    counts: Dict[str, int] = {}
+    for service in services:
+        state = service.get("state")
+        key = state.name.lower() if isinstance(state, ServiceState) else str(state)
+        counts[key] = counts.get(key, 0) + 1
+    summary = str(len(services))
+    if counts:
+        summary += " · " + " · ".join(f"{key} {count}" for key, count in sorted(counts.items()))
+    values["services"] = summary
+    gpus = report.get("gpus") or []
+    if gpus:
+        lines = []
+        for gpu in gpus:
+            util = gpu.get("utilizationPercent")
+            line = (
+                f"gpu{gpu.get('index', 0)} · {gpu.get('name') or '?'} · "
+                f"{'—' if util is None else f'{util:.0f} %'} busy · "
+                f"{format_bytes(int(gpu.get('memoryUsedBytes', 0)))} of "
+                f"{format_bytes(int(gpu.get('memoryTotalBytes', 0)))}"
+            )
+            if gpu.get("temperatureC"):
+                line += f" · {gpu['temperatureC']} °C"
+            if gpu.get("powerMilliwatts"):
+                line += f" · {gpu['powerMilliwatts'] / 1000:.0f} W"
+            lines.append(line)
+        values["gpus"] = "\n".join(lines)
+    elif report.get("gpuMonitoring"):
+        values["gpus"] = "none found"
+    return values
 
 
 # ── sidebar ──────────────────────────────────────────────────────────────────
@@ -635,6 +818,96 @@ class MetricTile(QFrame):
 
     def _apply_color(self) -> None:
         self.val.setStyleSheet(f"color: {self.value_color()};")
+
+
+class KeyValuePanel(QFrame):
+    """A titled panel of label / value pairs, two pairs to a row, fed from a
+    dict of values keyed like ``rows``. A key missing from the values hides
+    its row; a hint line replaces the rows while there are no values."""
+
+    def __init__(
+        self,
+        title: str,
+        rows: Sequence[Tuple[str, str]],
+        hint: str,
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.setObjectName("panel")
+        self.setStyleSheet(f"QFrame#panel {{ background: {TILE_BG}; border-radius: 6px; }}")
+        self._rows = tuple(rows)
+        self._shown: Tuple[str, ...] = ()
+        self._stale = False
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(10, 6, 10, 8)
+        outer.setSpacing(4)
+        self.lbl_title = QLabel(title)
+        self.lbl_title.setFont(ui_font(0.9))
+        self.lbl_title.setStyleSheet(f"color: {TEXT_DIM};")
+        outer.addWidget(self.lbl_title)
+        self.lbl_hint = QLabel(hint)
+        self.lbl_hint.setStyleSheet(f"color: {TEXT_MUTED};")
+        self.lbl_hint.setWordWrap(True)
+        outer.addWidget(self.lbl_hint)
+        self.grid = QGridLayout()
+        self.grid.setHorizontalSpacing(8)
+        self.grid.setVerticalSpacing(2)
+        outer.addLayout(self.grid)
+        self.labels: Dict[str, QLabel] = {}
+        self.values: Dict[str, QLabel] = {}
+        for key, label in self._rows:
+            lbl = QLabel(label)
+            lbl.setStyleSheet(f"color: {TEXT_MUTED};")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+            val = QLabel("—")
+            val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            val.setWordWrap(True)
+            val.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            lbl.hide()
+            val.hide()
+            self.labels[key] = lbl
+            self.values[key] = val
+        self._apply_color()
+
+    def set_values(self, values: Optional[Dict[str, str]]) -> None:
+        """Show ``values`` (None or empty: the hint instead of any row)."""
+        shown = tuple(key for key, _label in self._rows if values and key in values)
+        if shown != self._shown:
+            self._arrange(shown)
+        for key in shown:
+            self.values[key].setText(values[key])
+        self.lbl_hint.setVisible(not shown)
+
+    def set_hint(self, text: str) -> None:
+        self.lbl_hint.setText(text)
+
+    def shown_values(self) -> Dict[str, str]:
+        return {key: self.values[key].text() for key in self._shown}
+
+    def set_stale(self, stale: bool) -> None:
+        self._stale = stale
+        self._apply_color()
+
+    def _apply_color(self) -> None:
+        color = STALE_COLOR.name() if self._stale else TEXT
+        for val in self.values.values():
+            val.setStyleSheet(f"color: {color};")
+
+    def _arrange(self, shown: Tuple[str, ...]) -> None:
+        for key in self._shown:
+            self.grid.removeWidget(self.labels[key])
+            self.grid.removeWidget(self.values[key])
+            self.labels[key].hide()
+            self.values[key].hide()
+        for i, key in enumerate(shown):
+            row, pair = divmod(i, 2)
+            self.grid.addWidget(self.labels[key], row, pair * 2)
+            self.grid.addWidget(self.values[key], row, pair * 2 + 1)
+            self.labels[key].show()
+            self.values[key].show()
+        self.grid.setColumnStretch(1, 1)
+        self.grid.setColumnStretch(3, 1)
+        self._shown = shown
 
 
 class StatePill(QLabel):
@@ -1006,6 +1279,10 @@ class ProcessDetailPage(QWidget):
             self.tiles[key] = tile
         root.addLayout(tiles)
 
+        # What the manager measures beyond the health record (port 6668).
+        self.details = KeyValuePanel("Details · from the manager's detailed report", DETAIL_ROWS, NO_REPORT_TEXT)
+        root.addWidget(self.details)
+
         band_row = QHBoxLayout()
         band_row.setSpacing(10)
         self.lbl_band = QLabel("State · last 15 min")
@@ -1057,11 +1334,20 @@ class ProcessDetailPage(QWidget):
         self.graphs.set_process(name)
         self.set_members(members or [])
         self.clear_journal()
+        self.details.set_values(None)  # the window follows with set_details
         if report is None:
             self._show_no_report()
         else:
             self.update_report(report, gpu)
         self.tick(time.monotonic(), time.time())
+
+    def set_details(self, record: Optional[dict], report: Optional[dict]) -> None:
+        """The process's record of the manager's detailed report, or None
+        while there is no (current) report: the panel explains instead."""
+        if record is None or report is None:
+            self.details.set_values(None)
+        else:
+            self.details.set_values(details_values(record, report))
 
     def update_report(self, report: dict, gpu) -> None:
         self.report = report
@@ -1121,6 +1407,7 @@ class ProcessDetailPage(QWidget):
         state = self.report["state"] if self.report else RuntimeState.UNKNOWN
         self.pill.set_state(state, stale)
         self.lbl_meta.setStyleSheet(mono_style(STALE_COLOR.name() if stale else TEXT_DIM))
+        self.details.set_stale(stale)
         self.band.set_stale(stale)
 
     def tick(self, now: float, wall_now: float) -> None:
@@ -1180,6 +1467,11 @@ class ServiceDetailPage(QWidget):
         self.lbl_error.setVisible(False)
         root.addWidget(self.lbl_error)
 
+        # The manager's own figures (port 6668): shown on every platform, also
+        # where there is no systemd to ask.
+        self.host = KeyValuePanel("Host · from the manager's detailed report", HOST_ROWS, WAITING_REPORT_TEXT)
+        root.addWidget(self.host)
+
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(6)
@@ -1227,6 +1519,13 @@ class ServiceDetailPage(QWidget):
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([180, 420])
         root.addWidget(splitter, stretch=1)
+
+    def show_report(self, report: Optional[dict]) -> None:
+        """The latest detailed report, or None while there is none."""
+        self.host.set_values(host_values(report) if report else None)
+
+    def set_report_stale(self, stale: bool) -> None:
+        self.host.set_stale(stale)
 
     def show_snapshot(self, status: str, pairs: list, error: str) -> None:
         status = status or "(empty)"

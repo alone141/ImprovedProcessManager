@@ -1,11 +1,12 @@
 """Usage graphs: history recording, axes, hover values and the window."""
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 
+import process_monitor_gui as pmg
 import usage_graphs as ug
 from gpu_sampler import GpuProcessUsage
 from process_monitor_gui import ProcessMonitorWindow
@@ -157,8 +158,10 @@ def test_window_drops_processes_without_samples_in_view(app, monkeypatch):
 
 # ── recording from health reports ─────────────────────────────────────────
 
-def recorder(gpu_available, gpu_by_pid):
-    return SimpleNamespace(
+def recorder(gpu_available, gpu_by_pid, report=None):
+    """A stand-in window with the real GPU-source and recording methods; the
+    detailed report, when given, is current."""
+    window = SimpleNamespace(
         _current={
             "svc": {"pid": 42, "_cpu_pct": 12.5, "memoryUsageInBytes": 300 * MB},
             "stopped": {"pid": 0, "_cpu_pct": 0.0, "memoryUsageInBytes": 0},
@@ -166,10 +169,29 @@ def recorder(gpu_available, gpu_by_pid):
         _gpu_by_pid=gpu_by_pid,
         _gpu_available=gpu_available,
         _usage=ug.UsageHistory(),
+        _report=report,
+        _report_at=None if report is None else 1_000.0,
+        _report_services={s["name"]: s for s in (report or {}).get("services", [])},
+        _stale=False,
+        _feed=pmg.FeedMonitor(),
     )
+    for name in ("_gpu_for", "_details_for", "_report_current", "_report_age_stale", "_manager_gpu"):
+        setattr(window, name, MethodType(getattr(ProcessMonitorWindow, name), window))
+    return window
 
 
-def test_records_cpu_memory_and_gpu():
+def manager_report(gpu_valid=True):
+    return {
+        "gpuMonitoring": True,
+        "services": [
+            {"name": "svc", "gpuValid": gpu_valid, "gpuPercent": 55.0, "gpuMemoryBytes": 7 * MB},
+            {"name": "stopped", "gpuValid": False, "gpuPercent": None, "gpuMemoryBytes": 0},
+        ],
+    }
+
+
+def test_records_cpu_memory_and_gpu(monkeypatch):
+    monkeypatch.setattr(pmg.time, "monotonic", lambda: 1_000.0)
     window = recorder(True, {42: GpuProcessUsage(util_pct=30.0, vram_bytes=2 * MB)})
     ProcessMonitorWindow._record_usage(window, 5.0)
     assert window._usage.samples("svc", 0) == [ug.UsageSample(5.0, 12.5, 300 * MB, 30.0, 2 * MB)]
@@ -177,11 +199,39 @@ def test_records_cpu_memory_and_gpu():
     assert window._usage.samples("stopped", 0) == [ug.UsageSample(5.0, 0.0, 0, 0.0, 0)]
 
 
-def test_records_no_gpu_data_without_nvidia_smi():
+def test_records_no_gpu_data_without_nvidia_smi(monkeypatch):
+    monkeypatch.setattr(pmg.time, "monotonic", lambda: 1_000.0)
     window = recorder(False, {})
     ProcessMonitorWindow._record_usage(window, 5.0)
     [only] = window._usage.samples("svc", 0)
     assert only.gpu_pct is None and only.vram_bytes is None
+
+
+def test_the_managers_gpu_figures_win_over_nvidia_smi(monkeypatch):
+    monkeypatch.setattr(pmg.time, "monotonic", lambda: 1_000.0)
+    window = recorder(True, {42: GpuProcessUsage(util_pct=30.0, vram_bytes=2 * MB)}, manager_report())
+    assert window._manager_gpu()
+    assert window._gpu_for(window._current["svc"], "svc") == GpuProcessUsage(util_pct=55.0, vram_bytes=7 * MB)
+    ProcessMonitorWindow._record_usage(window, 5.0)
+    assert window._usage.samples("svc", 0) == [ug.UsageSample(5.0, 12.5, 300 * MB, 55.0, 7 * MB)]
+    # No figures for a stopped service under a GPU-monitoring manager: zero, not "no data"
+    assert window._usage.samples("stopped", 0) == [ug.UsageSample(5.0, 0.0, 0, 0.0, 0)]
+
+
+def test_without_manager_figures_for_a_service_nvidia_smi_fills_in(monkeypatch):
+    monkeypatch.setattr(pmg.time, "monotonic", lambda: 1_000.0)
+    window = recorder(True, {42: GpuProcessUsage(util_pct=30.0, vram_bytes=2 * MB)}, manager_report(gpu_valid=False))
+    assert window._gpu_for(window._current["svc"], "svc") == GpuProcessUsage(util_pct=30.0, vram_bytes=2 * MB)
+
+
+def test_a_report_that_stopped_arriving_no_longer_counts(monkeypatch):
+    monkeypatch.setattr(pmg.time, "monotonic", lambda: 1_000.0 + pmg.STALE_AFTER_SEC + 1)
+    window = recorder(False, {}, manager_report())
+    assert not window._report_current() and not window._manager_gpu()
+    assert window._details_for("svc") is None
+    assert window._gpu_for(window._current["svc"], "svc") is None
+    window._stale = True  # the whole feed is stale: the last report stays on show
+    assert window._report_current() and window._details_for("svc")["name"] == "svc"
 
 
 def test_history_gap_follows_the_report_interval():

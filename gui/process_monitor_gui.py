@@ -8,6 +8,8 @@ DEALER wire format (exactly as specified by you):
     send(CommandMessage)          # packed: uint8 cmd + char[32] name + char[32] args
 
 SUB: receives array of DetailedHealthReport (raw or length-prefixed)
+SUB (report): the manager's detailed report, frames "report" + payload
+    (per-service GPU figures, threads, I/O, exit codes; host figures)
 
 Layout: the sidebar lists the manager unit and every reported process; the
 pane on the right shows the selection — metric tiles, a state band and the
@@ -48,11 +50,13 @@ from PyQt6.QtWidgets import (
 )
 
 from health_structs import (
+    REPORT_TOPIC,
     CommandEnum,
     describe_reply,
     make_command_message,
     parse_command_reply,
     parse_health_reports,
+    parse_report_frames,
     report_to_dict,
 )
 from gpu_sampler import GpuSampler, GpuProcessUsage
@@ -105,34 +109,44 @@ from usage_graphs import UsageGraphWindow, UsageHistory, UsageSample
 
 _color_for_pid = color_for_pid  # former name
 
+# The manager's default ports (docs/protocol.md), as a client on the same host sees them.
+DEFAULT_SUB_ENDPOINT = "tcp://127.0.0.1:6667"
+DEFAULT_DEALER_ENDPOINT = "tcp://127.0.0.1:5557"
+DEFAULT_REPORT_ENDPOINT = "tcp://127.0.0.1:6668"
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ZMQ Worker
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ZmqWorker(QObject):
-    reports_received  = pyqtSignal(list)   # list[dict]
+    reports_received  = pyqtSignal(list)    # list[dict]
+    report_received   = pyqtSignal(object)  # dict: the detailed report (port 6668)
     connection_status = pyqtSignal(str)
     log_message       = pyqtSignal(str)
 
     def __init__(
         self,
-        sub_endpoint: str = "tcp://127.0.0.1:6667",
-        dealer_endpoint: str = "tcp://127.0.0.1:5557",
+        sub_endpoint: str = DEFAULT_SUB_ENDPOINT,
+        dealer_endpoint: str = DEFAULT_DEALER_ENDPOINT,
         sub_topic: bytes = b"",
         parent: Optional[QObject] = None,
+        report_endpoint: str = DEFAULT_REPORT_ENDPOINT,
     ):
         super().__init__(parent)
         self.sub_endpoint    = sub_endpoint
         self.dealer_endpoint = dealer_endpoint
         self.sub_topic       = sub_topic
+        self.report_endpoint = report_endpoint  # empty: the detailed report is not read
         self._running        = True   # until stop(); start() never re-arms it
         self._ctx: Optional[zmq.Context] = None
         self._sub: Optional[zmq.Socket] = None
+        self._report: Optional[zmq.Socket] = None
         self._dealer: Optional[zmq.Socket] = None
         self._command_queue: SimpleQueue = SimpleQueue()  # (label, payload)
         self._pending: Optional[Tuple[str, bytes]] = None  # command being sent
         self._pending_logged = False
+        self._report_error: Optional[str] = None  # last parse error shown
 
     @pyqtSlot()
     def start(self):
@@ -145,6 +159,14 @@ class ZmqWorker(QObject):
             self._sub.connect(self.sub_endpoint)
             self._sub.setsockopt(zmq.RCVTIMEO, 100)
 
+            # SUB for the detailed report: its own socket on the manager, topic "report"
+            if self.report_endpoint:
+                self._report = self._ctx.socket(zmq.SUB)
+                self._report.setsockopt(zmq.RCVHWM, 10)
+                self._report.setsockopt(zmq.SUBSCRIBE, REPORT_TOPIC)
+                self._report.connect(self.report_endpoint)
+                self._report.setsockopt(zmq.RCVTIMEO, 100)
+
             # DEALER – exact identity required by process manager
             self._dealer = self._ctx.socket(zmq.DEALER)
             self._dealer.setsockopt(zmq.IDENTITY, b"PMC")
@@ -156,7 +178,8 @@ class ZmqWorker(QObject):
             self.connection_status.emit("connected")
             self.log_message.emit(
                 f"SUB → {self.sub_endpoint}  |  "
-                f"DEALER(identity=PMC) → {self.dealer_endpoint}"
+                + (f"REPORT → {self.report_endpoint}  |  " if self._report is not None else "")
+                + f"DEALER(identity=PMC) → {self.dealer_endpoint}"
             )
         except zmq.ZMQError as e:
             self.connection_status.emit(f"error: {e}")
@@ -166,6 +189,8 @@ class ZmqWorker(QObject):
 
         poller = zmq.Poller()
         poller.register(self._sub, zmq.POLLIN)
+        if self._report is not None:
+            poller.register(self._report, zmq.POLLIN)
         # The C++ manager answers every command; older managers never do.
         poller.register(self._dealer, zmq.POLLIN)
 
@@ -219,6 +244,9 @@ class ZmqWorker(QObject):
                 except Exception as e:
                     self.log_message.emit(f"Recv error: {e}")
 
+            if self._report is not None and self._report in events:
+                self._read_report()
+
             if self._dealer in events:
                 self._read_replies()
 
@@ -227,6 +255,27 @@ class ZmqWorker(QObject):
 
     def stop(self):
         self._running = False
+
+    def _read_report(self) -> None:
+        """One detailed report; a payload this reader cannot parse is reported once."""
+        try:
+            frames = self._report.recv_multipart(flags=zmq.NOBLOCK)
+        except zmq.Again:
+            return
+        except zmq.ZMQError as e:
+            self.log_message.emit(f"Report recv error: {e}")
+            return
+        try:
+            report = parse_report_frames(frames)
+        except ValueError as e:
+            # Every interval brings another one; say it once, not each time.
+            if str(e) != self._report_error:
+                self._report_error = str(e)
+                self.log_message.emit(f"Report parse error: {e}")
+            return
+        if report is not None:
+            self._report_error = None
+            self.report_received.emit(report)
 
     def _read_replies(self) -> None:
         """Show each reply in the status bar, e.g. "restart vision: ok (restarting)"."""
@@ -251,6 +300,9 @@ class ZmqWorker(QObject):
         if self._sub:
             self._sub.close(linger=0)
             self._sub = None
+        if self._report:
+            self._report.close(linger=0)
+            self._report = None
         if self._dealer:
             self._dealer.close(linger=0)
             self._dealer = None
@@ -704,10 +756,12 @@ class ProcessMonitorWindow(QMainWindow):
         sub_endpoint: str,
         dealer_endpoint: str,
         parent: Optional[QWidget] = None,
+        report_endpoint: str = DEFAULT_REPORT_ENDPOINT,
     ):
         super().__init__(parent)
         self.sub_endpoint    = sub_endpoint
         self.dealer_endpoint = dealer_endpoint
+        self.report_endpoint = report_endpoint
 
         self.setWindowTitle("Process Manager – Health Monitor")
         fit_to_screen(self, QSize(1180, 760), minimum=QSize(900, 600))
@@ -721,7 +775,15 @@ class ProcessMonitorWindow(QMainWindow):
         self._stale = False  # the pages show data that stopped updating
         self._link_status: Optional[Tuple[str, str, str]] = None
         self._last_gpu_error: Optional[str] = None
+        self._gpu_error: Optional[str] = "GPU sampler starting…"
         self._gpu_available = False
+        self._gpu_status: Optional[Tuple[str, str, str]] = None
+        # The detailed report (port 6668): the latest one, when it came, and
+        # its service records by name.
+        self._report: Optional[dict] = None
+        self._report_at: Optional[float] = None
+        self._report_services: Dict[str, dict] = {}
+        self._report_state: Optional[Tuple[bool, bool]] = None  # (greyed, current)
         self._usage = UsageHistory()  # recorded from the start, for the graphs
         self._usage_window: Optional[UsageGraphWindow] = None
         self._auto_select = True  # show the first process once reports arrive
@@ -766,7 +828,7 @@ class ProcessMonitorWindow(QMainWindow):
 
         self.lbl_gpu = QLabel("GPU …")
         toolbar.addWidget(self.lbl_gpu)
-        self._update_gpu_status_label(False, "GPU sampler starting…")
+        self._refresh_gpu_status()
 
         self.btn_connection = QToolButton()
         self.btn_connection.setText("Connection")
@@ -788,6 +850,16 @@ class ProcessMonitorWindow(QMainWindow):
         self.edit_sub.setClearButtonEnabled(True)
         self.edit_sub.returnPressed.connect(self._reconnect)
         strip.addWidget(self.edit_sub)
+        strip.addSpacing(8)
+        strip.addWidget(QLabel("REPORT"))
+        self.edit_report = QLineEdit(self.report_endpoint)
+        self.edit_report.setPlaceholderText("tcp://host:port")
+        self.edit_report.setToolTip(
+            "ZMQ SUB endpoint for the manager's detailed report (topic 'report')"
+        )
+        self.edit_report.setClearButtonEnabled(True)
+        self.edit_report.returnPressed.connect(self._reconnect)
+        strip.addWidget(self.edit_report)
         strip.addSpacing(8)
         strip.addWidget(QLabel("DEALER"))
         self.edit_dealer = QLineEdit(self.dealer_endpoint)
@@ -880,7 +952,8 @@ class ProcessMonitorWindow(QMainWindow):
 
     def _show_endpoints(self) -> None:
         self.lbl_endpoints.setText(
-            f"SUB {self.sub_endpoint}   ·   DEALER {self.dealer_endpoint}"
+            f"SUB {self.sub_endpoint}   ·   REPORT {self.report_endpoint}   ·   "
+            f"DEALER {self.dealer_endpoint}"
         )
 
     def _show_status(self, message: str) -> None:
@@ -895,8 +968,9 @@ class ProcessMonitorWindow(QMainWindow):
         self.stack.setCurrentWidget(self.detail)
         report = self._current.get(name)
         self.detail.set_process(
-            name, report, self._gpu_for(report), self._cgroup_members.get(name) or []
+            name, report, self._gpu_for(report, name), self._cgroup_members.get(name) or []
         )
+        self.detail.set_details(self._details_for(name), self._report)
         self.detail.set_stale(self._stale)
         worker = getattr(self, "detail_journal_worker", None)
         if worker is not None:
@@ -909,10 +983,64 @@ class ProcessMonitorWindow(QMainWindow):
         if worker is not None:
             worker.set_process("")  # nothing to tail while the manager is shown
 
-    def _gpu_for(self, report: Optional[dict]) -> Optional[GpuProcessUsage]:
-        if not report or not report.get("pid"):
+    def _gpu_for(self, report: Optional[dict], name: str = "") -> Optional[GpuProcessUsage]:
+        """GPU use of a process: the manager's figures (NVML on its host, summed
+        over the service's processes) when it has them, else local nvidia-smi
+        joined by PID, else None."""
+        if not report:
+            return None
+        record = self._details_for(name or report.get("processName", ""))
+        if record is not None and record.get("gpuValid"):
+            return GpuProcessUsage(
+                util_pct=record.get("gpuPercent"), vram_bytes=int(record.get("gpuMemoryBytes", 0))
+            )
+        if not report.get("pid"):
             return None
         return self._gpu_by_pid.get(report["pid"])
+
+    # ── the detailed report ───────────────────────────────────────────────
+
+    def _report_age_stale(self) -> bool:
+        return (
+            self._report_at is not None
+            and time.monotonic() - self._report_at > self._feed.stale_after()
+        )
+
+    def _report_current(self) -> bool:
+        """A report arrived recently, or the whole feed is stale (then the last
+        report stays on show, greyed out like everything else)."""
+        return self._report_at is not None and (self._stale or not self._report_age_stale())
+
+    def _details_for(self, name: str) -> Optional[dict]:
+        """The service's record of the detailed report, while the report is current."""
+        return self._report_services.get(name) if self._report_current() else None
+
+    def _manager_gpu(self) -> bool:
+        """The manager measures GPU use itself (NVML on its host)."""
+        return self._report_current() and bool(self._report and self._report.get("gpuMonitoring"))
+
+    def _apply_report_state(self) -> None:
+        """Grey the host overview when the report (or the feed) is stale; drop
+        the details and the manager's GPU figures once the report is gone."""
+        state = (self._stale or self._report_age_stale(), self._report_current())
+        if state == self._report_state:
+            return
+        self._report_state = state
+        self.service_page.set_report_stale(state[0])
+        self._refresh_gpu_status()
+        self._refresh_detail()
+
+    @pyqtSlot(object)
+    def _on_report(self, report) -> None:
+        if not isinstance(report, dict):
+            return
+        self._report = report
+        self._report_at = time.monotonic()
+        self._report_services = {s["name"]: s for s in report.get("services", [])}
+        self.service_page.show_report(report)
+        self._apply_report_state()
+        self._refresh_gpu_status()
+        self._refresh_detail()
 
     def _refresh_detail(self) -> None:
         name = self.detail.name
@@ -920,33 +1048,39 @@ class ProcessMonitorWindow(QMainWindow):
             return
         report = self._current.get(name)
         if report is not None:
-            self.detail.update_report(report, self._gpu_for(report))
+            self.detail.update_report(report, self._gpu_for(report, name))
+        self.detail.set_details(self._details_for(name), self._report)
 
     def _apply_stale(self) -> None:
         self.sidebar.set_stale(self._stale)
         self.detail.set_stale(self._stale)
+        self._apply_report_state()
 
     # ── ZMQ worker lifecycle ──────────────────────────────────────────────
 
-    def _get_endpoints(self) -> tuple[str, str]:
+    def _get_endpoints(self) -> tuple[str, str, str]:
         sub    = self.edit_sub.text().strip()    or self.sub_endpoint
         dealer = self.edit_dealer.text().strip() or self.dealer_endpoint
-        return sub, dealer
+        report = self.edit_report.text().strip() or self.report_endpoint
+        return sub, dealer, report
 
     def _start_zmq_worker(self):
-        sub, dealer = self._get_endpoints()
+        sub, dealer, report = self._get_endpoints()
         self.sub_endpoint    = sub
         self.dealer_endpoint = dealer
+        self.report_endpoint = report
         self.edit_sub.setText(sub)
         self.edit_dealer.setText(dealer)
+        self.edit_report.setText(report)
         self._show_endpoints()
 
         self.worker_thread = QThread()
-        self.worker = ZmqWorker(sub, dealer)
+        self.worker = ZmqWorker(sub, dealer, report_endpoint=report)
         self.worker.moveToThread(self.worker_thread)
 
         self.worker_thread.started.connect(self.worker.start)
         self.worker.reports_received.connect(self._on_reports)
+        self.worker.report_received.connect(self._on_report)
         self.worker.connection_status.connect(self._on_connection_status)
         self.worker.log_message.connect(self._on_log)
 
@@ -956,6 +1090,7 @@ class ProcessMonitorWindow(QMainWindow):
         if hasattr(self, "worker") and self.worker is not None:
             for sig in (
                 self.worker.reports_received,
+                self.worker.report_received,
                 self.worker.connection_status,
                 self.worker.log_message,
             ):
@@ -1091,10 +1226,11 @@ class ProcessMonitorWindow(QMainWindow):
     def _record_usage(self, now: float) -> None:
         """Sample every process for the usage graphs and the state band."""
         for name, r in self._current.items():
-            gpu = self._gpu_by_pid.get(r["pid"]) if r["pid"] else None
-            if self._gpu_available:  # not on the GPU list: using none of it
-                gpu_pct = gpu.util_pct if gpu else 0.0
-                vram = gpu.vram_bytes if gpu else 0
+            gpu = self._gpu_for(r, name)
+            if gpu is not None:
+                gpu_pct, vram = gpu.util_pct, gpu.vram_bytes
+            elif self._gpu_available or self._manager_gpu():
+                gpu_pct, vram = 0.0, 0  # measured, and not on the list: using none of it
             else:
                 gpu_pct = vram = None
             state = r.get("state")
@@ -1132,6 +1268,7 @@ class ProcessMonitorWindow(QMainWindow):
         if stale != self._stale:
             self._stale = stale
             self._apply_stale()  # grey out / restore the pages
+        self._apply_report_state()
         if self.stack.currentWidget() is self.detail:
             self.detail.tick(now, time.time())
         status = self._feed.status(now)
@@ -1159,17 +1296,39 @@ class ProcessMonitorWindow(QMainWindow):
     def _on_log(self, msg: str):
         self._show_status(msg)
 
-    def _update_gpu_status_label(
-        self, available: bool, err: Optional[str] = None
-    ) -> None:
-        if available:
-            self.lbl_gpu.setText("GPU ok")
-            self.lbl_gpu.setStyleSheet(pill_style("#4caf50"))
-            self.lbl_gpu.setToolTip("nvidia-smi sampling active")
-        else:
-            self.lbl_gpu.setText("GPU unavailable")
-            self.lbl_gpu.setStyleSheet(pill_style("#f44336"))
-            self.lbl_gpu.setToolTip(err or "nvidia-smi unavailable")
+    def gpu_source(self) -> Tuple[str, str, str]:
+        """(text, colour, tooltip) of the toolbar pill: where GPU figures come from."""
+        if self._manager_gpu():
+            return (
+                "GPU · manager",
+                "#4caf50",
+                "GPU figures measured on the manager's host (NVML), summed over each "
+                "service's processes"
+                + ("; this machine's nvidia-smi is not used" if self._gpu_available else ""),
+            )
+        if self._gpu_available:
+            return (
+                "GPU · nvidia-smi",
+                "#4caf50",
+                "GPU figures from this machine's nvidia-smi, joined by PID: only right "
+                "when the GUI runs on the manager's host",
+            )
+        return (
+            "GPU unavailable",
+            "#f44336",
+            (self._gpu_error or "nvidia-smi unavailable")
+            + "; the manager reports no GPU monitoring",
+        )
+
+    def _refresh_gpu_status(self) -> None:
+        status = self.gpu_source()
+        if status == self._gpu_status:
+            return
+        self._gpu_status = status
+        text, color, tooltip = status
+        self.lbl_gpu.setText(text)
+        self.lbl_gpu.setStyleSheet(pill_style(color))
+        self.lbl_gpu.setToolTip(tooltip)
 
     @pyqtSlot(object, object, bool)
     def _on_gpu_sampled(self, result, err, available: bool):
@@ -1184,7 +1343,8 @@ class ProcessMonitorWindow(QMainWindow):
             self._gpu_by_pid = new_map
         self._last_gpu_error = err if failed else None
         self._gpu_available = available and not failed
-        self._update_gpu_status_label(self._gpu_available, err if isinstance(err, str) else None)
+        self._gpu_error = err if isinstance(err, str) else None
+        self._refresh_gpu_status()
         self._refresh_detail()
 
     @pyqtSlot(object)
@@ -1238,15 +1398,25 @@ class ProcessMonitorWindow(QMainWindow):
         self._feed.on_disconnected()
         self._link_up = False
         self._prev.clear()
+        self._forget_report()
         self._set_link_status("Reconnecting…", "orange")
 
         self._stop_zmq_worker(timeout_ms=4000)
         self._start_zmq_worker()
         self.btn_reconnect.setEnabled(True)
         self._show_status(
-            f"Connecting to SUB={self.sub_endpoint}  "
+            f"Connecting to SUB={self.sub_endpoint}  REPORT={self.report_endpoint}  "
             f"DEALER={self.dealer_endpoint}  (id=PMC)"
         )
+
+    def _forget_report(self) -> None:
+        """The next connection starts without a report, like the first one."""
+        self._report = None
+        self._report_at = None
+        self._report_services = {}
+        self._report_state = None
+        self.service_page.show_report(None)
+        self._apply_report_state()
 
     def _send_cmd(self, cmd: CommandEnum, name: str):
         reply = QMessageBox.question(
@@ -1301,20 +1471,25 @@ def main():
     )
     parser.add_argument(
         "--sub",
-        default="tcp://127.0.0.1:6667",
-        help="ZMQ SUB endpoint (default: tcp://127.0.0.1:6667)",
+        default=DEFAULT_SUB_ENDPOINT,
+        help=f"ZMQ SUB endpoint for the health report (default: {DEFAULT_SUB_ENDPOINT})",
     )
     parser.add_argument(
         "--dealer",
-        default="tcp://127.0.0.1:5557",
-        help="ZMQ DEALER endpoint (default: tcp://127.0.0.1:5557)",
+        default=DEFAULT_DEALER_ENDPOINT,
+        help=f"ZMQ DEALER endpoint for commands (default: {DEFAULT_DEALER_ENDPOINT})",
+    )
+    parser.add_argument(
+        "--report",
+        default=DEFAULT_REPORT_ENDPOINT,
+        help=f"ZMQ SUB endpoint for the detailed report (default: {DEFAULT_REPORT_ENDPOINT})",
     )
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
     apply_dark_theme(app)
 
-    win = ProcessMonitorWindow(args.sub, args.dealer)
+    win = ProcessMonitorWindow(args.sub, args.dealer, report_endpoint=args.report)
     win.show()
     sys.exit(app.exec())
 

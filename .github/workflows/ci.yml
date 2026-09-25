@@ -1,4 +1,4 @@
-# Builds and tests both programs on every push and pull request.
+# Builds and tests both programs on every push to main and every pull request.
 #
 # The build itself downloads nothing (manager/README.md, "Airgapped machines"):
 # each job installs distribution packages or unpacks the vendored sources
@@ -196,9 +196,12 @@ jobs:
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure --timeout 120
 
+      # PowerShell carries on past a failing program and the step takes the
+      # last one's exit code, so the first is checked by hand.
       - name: Command-line smoke test
         run: |
           build\src\Release\berayprocessmanager.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           build\src\Release\berayprocessmanager.exe --check --config manager\config\services.conf
 
   gui-tests:

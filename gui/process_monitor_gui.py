@@ -122,7 +122,7 @@ DEFAULT_ENDPOINTS = {
 ENDPOINT_KEYS = ("sub", "dealer", "report")
 
 # Where the endpoints used last time are kept: an INI file per user
-# (%APPDATA%\beray\ProcessMonitor.ini, ~/.config/beray/ProcessMonitor.conf).
+# (%APPDATA%\beray\ProcessMonitor.ini, ~/.config/beray/ProcessMonitor.ini).
 SETTINGS_ORGANISATION = "beray"
 SETTINGS_APPLICATION = "ProcessMonitor"
 

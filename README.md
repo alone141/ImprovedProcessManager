@@ -50,9 +50,10 @@ as a standalone executable (`gui/scripts/build_executable.sh`).
 
 ## Continuous integration
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push and
-pull request. The build still downloads nothing; each job installs packages or
-unpacks sources first, the way a networked machine prepares an offline one.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push to
+`main` and every pull request. The build still downloads nothing; each job
+installs packages or unpacks sources first, the way a networked machine
+prepares an offline one.
 
 | Job | Checks |
 |-----|--------|

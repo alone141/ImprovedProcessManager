@@ -144,7 +144,7 @@ ACTION_STYLES: Dict[CommandEnum, str] = {
 # The manager page's whole-manager actions: label, tooltip.
 MANAGER_ACTIONS: Tuple[Tuple[CommandEnum, str, str], ...] = (
     (CommandEnum.START, "Start all", "Start every service, each after what it depends on"),
-    (CommandEnum.STOP, "Stop all", "Stop every service, dependents first"),
+    (CommandEnum.STOP, "Stop all", "Stop every service at once"),
     (CommandEnum.RESTART, "Restart all", "Restart every service"),
     (
         CommandEnum.RELOAD,

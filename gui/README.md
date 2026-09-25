@@ -32,7 +32,7 @@ Without it, the GUI samples **local** NVIDIA GPU usage via **nvidia-smi** and jo
 
 ## Manager page
 
-The header has the whole-manager actions. **Start all**, **Stop all** and **Restart all** send the command with the service name `*`, which the manager applies to every service in dependency order (dependents stop first); **Reload configuration** sends command 91, and the manager re-reads its file: new services are added and started when they autostart, removed ones are stopped, changed ones take their settings at their next start. Stopping and restarting everything ask for confirmation. The manager's reply appears in the status bar as for any command, for example `stop *: ok (stop sent to 5 services)` or `reload: reload failed (line 12: unknown key)`. The buttons are enabled while the command socket is connected.
+The header has the whole-manager actions. **Start all**, **Stop all** and **Restart all** send the command with the service name `*`, which the manager applies to every service: starting and restarting bring each service up after what it depends on, and stopping stops them all at once (only the manager's own shutdown stops them in reverse dependency order); **Reload configuration** sends command 91, and the manager re-reads its file: new services are added and started when they autostart, removed ones are stopped, changed ones take their settings at their next start. Stopping and restarting everything ask for confirmation. The manager's reply appears in the status bar as for any command, for example `stop *: ok (stop sent to 5 services)` or `reload: reload failed (line 12: unknown key)`. The buttons are enabled while the command socket is connected.
 
 The page continues with a **host overview** from the detailed report: host name, manager version, PID and uptime, publish interval, cgroup and GPU monitoring, host CPU %, memory used of total, load averages, host uptime, the services by state and one line per GPU (utilisation, memory, temperature, power). It works on every platform, also where there is no systemd to ask; until the first report it says it is waiting.
 
@@ -71,7 +71,7 @@ python process_monitor_gui.py \
 
 GUI flags: `--sub` (health SUB), `--report` (detailed report SUB), `--dealer` (command DEALER). Mock binds with `--pub` / `--report` / `--router` (see `mock_publisher.py --help`).
 
-An endpoint the command line does not give is the one used last time, and only then the default: the GUI stores the endpoints it connects with (also after *Reconnect* in the connection strip) in a per-user file, `%APPDATA%\beray\ProcessMonitor.ini` on Windows and `~/.config/beray/ProcessMonitor.conf` on Linux. `--no-remember` neither reads nor writes it, for scripts and tests.
+An endpoint the command line does not give is the one used last time, and only then the default: the GUI stores the endpoints it connects with (also after *Reconnect* in the connection strip) in a per-user file, `%APPDATA%\beray\ProcessMonitor.ini` on Windows and `~/.config/beray/ProcessMonitor.ini` on Linux. `--no-remember` neither reads nor writes it, for scripts and tests.
 
 ## Standalone executable (nothing to install on the target)
 

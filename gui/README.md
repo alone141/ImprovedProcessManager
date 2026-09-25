@@ -11,7 +11,8 @@ A GUI for monitoring and controlling services run by a central process manager o
 - **Graphs tab** — CPU %, memory, GPU % and VRAM for the selected process over the last 1/5/15 minutes; hover to read values, tick other processes under *Compare* to overlay them, *Pop out* opens the graphs in their own window. Recording starts with the GUI (one sample a second, 15 minutes kept), so the recent past is there when you look
 - **cgroup PIDs tab** — the PIDs in `task_<name>/cgroup.procs` with comm, RSS and command line; double-click one for its `journalctl _PID=` window
 - **Journal tab** — live `journalctl _SYSTEMD_CGROUP=…/task_<name>`, lines coloured by PID
-- **Manager page** (select `berayprocessmanager`) — a **host overview** from the detailed report (host name, manager version, PID and uptime, host CPU, memory, load, GPUs, services by state; every platform), then live `systemctl status` + journal for `berayprocessmanager.service` (Linux)
+- **Manager page** (select `berayprocessmanager`) — **Start all / Stop all / Restart all / Reload configuration** (the manager's `*` target and its reload command; stopping and restarting everything ask first), a **host overview** from the detailed report (host name, manager version, PID and uptime, host CPU, memory, load, GPUs, services by state; every platform), then live `systemctl status` + journal for `berayprocessmanager.service` (Linux)
+- **Remembered endpoints** — the endpoints used last time are stored per user and used again when the command line gives none (`--no-remember` turns that off)
 - Thread-safe ZMQ handling (never blocks the GUI)
 - Dark Fusion theme; sizes follow the system font and display scaling
 
@@ -31,7 +32,9 @@ Without it, the GUI samples **local** NVIDIA GPU usage via **nvidia-smi** and jo
 
 ## Manager page
 
-The page opens with a **host overview** from the detailed report: host name, manager version, PID and uptime, publish interval, cgroup and GPU monitoring, host CPU %, memory used of total, load averages, host uptime, the services by state and one line per GPU (utilisation, memory, temperature, power). It works on every platform, also where there is no systemd to ask; until the first report it says it is waiting.
+The header has the whole-manager actions. **Start all**, **Stop all** and **Restart all** send the command with the service name `*`, which the manager applies to every service in dependency order (dependents stop first); **Reload configuration** sends command 91, and the manager re-reads its file: new services are added and started when they autostart, removed ones are stopped, changed ones take their settings at their next start. Stopping and restarting everything ask for confirmation. The manager's reply appears in the status bar as for any command, for example `stop *: ok (stop sent to 5 services)` or `reload: reload failed (line 12: unknown key)`. The buttons are enabled while the command socket is connected.
+
+The page continues with a **host overview** from the detailed report: host name, manager version, PID and uptime, publish interval, cgroup and GPU monitoring, host CPU %, memory used of total, load averages, host uptime, the services by state and one line per GPU (utilisation, memory, temperature, power). It works on every platform, also where there is no systemd to ask; until the first report it says it is waiting.
 
 On Linux hosts with systemd, the manager page (first sidebar entry) auto-refreshes every 2s:
 
@@ -67,6 +70,8 @@ python process_monitor_gui.py \
 ```
 
 GUI flags: `--sub` (health SUB), `--report` (detailed report SUB), `--dealer` (command DEALER). Mock binds with `--pub` / `--report` / `--router` (see `mock_publisher.py --help`).
+
+An endpoint the command line does not give is the one used last time, and only then the default: the GUI stores the endpoints it connects with (also after *Reconnect* in the connection strip) in a per-user file, `%APPDATA%\beray\ProcessMonitor.ini` on Windows and `~/.config/beray/ProcessMonitor.conf` on Linux. `--no-remember` neither reads nor writes it, for scripts and tests.
 
 ## Standalone executable (nothing to install on the target)
 
@@ -133,9 +138,7 @@ takes `--pub`, `--report` and `--router`.
 
 ## Next Steps
 
-- Offer the manager's `*` target ("start all" / "stop all") and `--reload`
 - Add authentication/encryption if needed (ZMQ CURVE)
-- Persist last used addresses in QSettings
 
 ## File Structure
 

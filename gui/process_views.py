@@ -54,6 +54,7 @@ from PyQt6.QtWidgets import (
 )
 
 from health_structs import (
+    ALL_SERVICES,
     RESTART_MODE_TEXT,
     CommandEnum,
     RuntimeState,
@@ -137,7 +138,21 @@ ACTION_STYLES: Dict[CommandEnum, str] = {
     CommandEnum.START: _action_style("#2e7d32", "#388e3c"),
     CommandEnum.STOP: _action_style("#c62828", "#d32f2f"),
     CommandEnum.RESTART: _action_style("#ef6c00", "#fb8c00"),
+    CommandEnum.RELOAD: _action_style("#37474f", "#455a64"),
 }
+
+# The manager page's whole-manager actions: label, tooltip.
+MANAGER_ACTIONS: Tuple[Tuple[CommandEnum, str, str], ...] = (
+    (CommandEnum.START, "Start all", "Start every service, each after what it depends on"),
+    (CommandEnum.STOP, "Stop all", "Stop every service, dependents first"),
+    (CommandEnum.RESTART, "Restart all", "Restart every service"),
+    (
+        CommandEnum.RELOAD,
+        "Reload configuration",
+        "Re-read the configuration file: new services are added (and started when autostart), "
+        "removed ones are stopped, changed ones take their settings at their next start",
+    ),
+)
 
 TAB_STYLE = f"""
     QTabWidget::pane {{ border: 1px solid {BORDER}; background: {BG}; }}
@@ -1439,7 +1454,10 @@ class ProcessDetailPage(QWidget):
 
 
 class ServiceDetailPage(QWidget):
-    """systemctl status and the journal of the manager unit."""
+    """The manager: whole-manager actions, the host overview from its report,
+    then systemctl status and the journal of the manager unit."""
+
+    command_requested = pyqtSignal(object, str)  # CommandEnum, "*" or "" for reload
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -1456,9 +1474,16 @@ class ServiceDetailPage(QWidget):
         self.lbl_unit.setStyleSheet(mono_style(TEXT_DIM))
         header.addWidget(self.lbl_unit)
         header.addStretch()
-        self.lbl_refresh = QLabel("Last refresh: —")
-        self.lbl_refresh.setStyleSheet(f"color: {TEXT_MUTED};")
-        header.addWidget(self.lbl_refresh)
+        # Enabled while the command link is up (set_link_up).
+        self.buttons: Dict[CommandEnum, QPushButton] = {}
+        for command, label, tip in MANAGER_ACTIONS:
+            button = QPushButton(label)
+            button.setStyleSheet(ACTION_STYLES[command])
+            button.setToolTip(tip)
+            button.setEnabled(False)
+            button.clicked.connect(lambda _checked=False, c=command: self._request(c))
+            header.addWidget(button)
+            self.buttons[command] = button
         root.addLayout(header)
         # Fetch errors (no systemd, journalctl failed…) get a line of their own.
         self.lbl_error = QLabel()
@@ -1480,9 +1505,15 @@ class ServiceDetailPage(QWidget):
         status_layout = QVBoxLayout(status_box)
         status_layout.setContentsMargins(0, 0, 0, 0)
         status_layout.setSpacing(4)
+        status_row = QHBoxLayout()
         lbl_status = QLabel("systemctl status (unit metadata only)")
         lbl_status.setStyleSheet(f"color: {TEXT_DIM};")
-        status_layout.addWidget(lbl_status)
+        status_row.addWidget(lbl_status)
+        status_row.addStretch()
+        self.lbl_refresh = QLabel("Last refresh: —")
+        self.lbl_refresh.setStyleSheet(f"color: {TEXT_MUTED};")
+        status_row.addWidget(self.lbl_refresh)
+        status_layout.addLayout(status_row)
         self.txt_status = QPlainTextEdit()
         self.txt_status.setReadOnly(True)
         self.txt_status.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
@@ -1519,6 +1550,14 @@ class ServiceDetailPage(QWidget):
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([180, 420])
         root.addWidget(splitter, stretch=1)
+
+    def set_link_up(self, up: bool) -> None:
+        """Whole-manager actions need the command socket."""
+        for button in self.buttons.values():
+            button.setEnabled(up)
+
+    def _request(self, command: CommandEnum) -> None:
+        self.command_requested.emit(command, "" if command == CommandEnum.RELOAD else ALL_SERVICES)
 
     def show_report(self, report: Optional[dict]) -> None:
         """The latest detailed report, or None while there is none."""

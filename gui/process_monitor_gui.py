@@ -29,7 +29,7 @@ from queue import Empty, SimpleQueue
 from typing import Deque, Dict, List, Optional, Tuple
 
 import zmq
-from PyQt6.QtCore import QObject, QSize, QThread, QTimer, pyqtSignal, pyqtSlot, Qt
+from PyQt6.QtCore import QObject, QSettings, QSize, QThread, QTimer, pyqtSignal, pyqtSlot, Qt
 from PyQt6.QtGui import QColor, QFont, QPalette, QTextOption
 from PyQt6.QtWidgets import (
     QApplication,
@@ -50,6 +50,7 @@ from PyQt6.QtWidgets import (
 )
 
 from health_structs import (
+    ALL_SERVICES,
     REPORT_TOPIC,
     CommandEnum,
     describe_reply,
@@ -113,6 +114,79 @@ _color_for_pid = color_for_pid  # former name
 DEFAULT_SUB_ENDPOINT = "tcp://127.0.0.1:6667"
 DEFAULT_DEALER_ENDPOINT = "tcp://127.0.0.1:5557"
 DEFAULT_REPORT_ENDPOINT = "tcp://127.0.0.1:6668"
+DEFAULT_ENDPOINTS = {
+    "sub": DEFAULT_SUB_ENDPOINT,
+    "dealer": DEFAULT_DEALER_ENDPOINT,
+    "report": DEFAULT_REPORT_ENDPOINT,
+}
+ENDPOINT_KEYS = ("sub", "dealer", "report")
+
+# Where the endpoints used last time are kept: an INI file per user
+# (%APPDATA%\beray\ProcessMonitor.ini, ~/.config/beray/ProcessMonitor.conf).
+SETTINGS_ORGANISATION = "beray"
+SETTINGS_APPLICATION = "ProcessMonitor"
+
+
+def open_settings() -> QSettings:
+    return QSettings(
+        QSettings.Format.IniFormat,
+        QSettings.Scope.UserScope,
+        SETTINGS_ORGANISATION,
+        SETTINGS_APPLICATION,
+    )
+
+
+def stored_endpoints(settings: QSettings) -> Dict[str, str]:
+    """The endpoints a previous run stored, by key ("sub", "dealer", "report")."""
+    found: Dict[str, str] = {}
+    for key in ENDPOINT_KEYS:
+        value = settings.value(f"endpoints/{key}", "", type=str)
+        if value:
+            found[key] = value
+    return found
+
+
+def store_endpoints(settings: QSettings, sub: str, dealer: str, report: str) -> None:
+    for key, value in (("sub", sub), ("dealer", dealer), ("report", report)):
+        settings.setValue(f"endpoints/{key}", value)
+    settings.sync()
+
+
+def resolve_endpoints(
+    given: Dict[str, Optional[str]], stored: Dict[str, str]
+) -> Tuple[str, str, str]:
+    """(sub, dealer, report): what the command line gave wins, then what was
+    stored last time, then the defaults."""
+    return tuple(  # type: ignore[return-value]
+        given.get(key) or stored.get(key) or DEFAULT_ENDPOINTS[key] for key in ENDPOINT_KEYS
+    )
+
+
+def command_question(command: CommandEnum, name: str) -> Optional[Tuple[str, str]]:
+    """(title, text) of the confirmation to ask before sending, or None when
+    none is needed: reloading the configuration and starting everything are
+    harmless; stopping or restarting a service, or all of them, are not."""
+    if command == CommandEnum.RELOAD:
+        return None
+    verb = command.name.lower()
+    if name == ALL_SERVICES:
+        if command == CommandEnum.START:
+            return None
+        return (
+            f"Confirm {verb} all",
+            f"Are you sure you want to <b>{verb}</b> <b>every service</b> the manager runs?",
+        )
+    return (
+        f"Confirm {command.name.title()}",
+        f"Are you sure you want to <b>{verb}</b> process <b>{name}</b>?",
+    )
+
+
+def command_label(command: CommandEnum, name: str) -> str:
+    """How a command is called in the status bar: "STOP for svc", "STOP for every service", "RELOAD"."""
+    if not name:
+        return command.name
+    return f"{command.name} for {'every service' if name == ALL_SERVICES else name}"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -294,7 +368,7 @@ class ZmqWorker(QObject):
     def send_command(self, command: CommandEnum, service_name: str, args: str = ""):
         """Thread-safe: SimpleQueue from any thread; worker drains it."""
         payload = make_command_message(command, service_name, args)
-        self._command_queue.put((f"{command.name} for {service_name}", payload))
+        self._command_queue.put((command_label(command, service_name), payload))
 
     def _cleanup(self):
         if self._sub:
@@ -757,11 +831,13 @@ class ProcessMonitorWindow(QMainWindow):
         dealer_endpoint: str,
         parent: Optional[QWidget] = None,
         report_endpoint: str = DEFAULT_REPORT_ENDPOINT,
+        settings: Optional[QSettings] = None,
     ):
         super().__init__(parent)
         self.sub_endpoint    = sub_endpoint
         self.dealer_endpoint = dealer_endpoint
         self.report_endpoint = report_endpoint
+        self._settings = settings  # the endpoints used are stored here, when given
 
         self.setWindowTitle("Process Manager – Health Monitor")
         fit_to_screen(self, QSize(1180, 760), minimum=QSize(900, 600))
@@ -905,6 +981,7 @@ class ProcessMonitorWindow(QMainWindow):
         self.detail.pid_activated.connect(self._on_pid_activated)
         self.detail.pop_out_requested.connect(self._open_usage_graphs)
         self.service_page = ServiceDetailPage()
+        self.service_page.command_requested.connect(self._send_cmd)
         self.stack = QStackedWidget()
         self.stack.addWidget(self.service_page)
         self.stack.addWidget(self.detail)
@@ -1073,6 +1150,8 @@ class ProcessMonitorWindow(QMainWindow):
         self.edit_dealer.setText(dealer)
         self.edit_report.setText(report)
         self._show_endpoints()
+        if self._settings is not None:
+            store_endpoints(self._settings, sub, dealer, report)
 
         self.worker_thread = QThread()
         self.worker = ZmqWorker(sub, dealer, report_endpoint=report)
@@ -1250,6 +1329,7 @@ class ProcessMonitorWindow(QMainWindow):
     @pyqtSlot(str)
     def _on_connection_status(self, status: str):
         self._link_up = status == "connected"
+        self.service_page.set_link_up(self._link_up)
         if status == "connected":
             # Sockets are up; the feed only counts as live once reports arrive.
             self._feed.on_connected(time.monotonic())
@@ -1397,6 +1477,7 @@ class ProcessMonitorWindow(QMainWindow):
         self.btn_reconnect.setEnabled(False)
         self._feed.on_disconnected()
         self._link_up = False
+        self.service_page.set_link_up(False)
         self._prev.clear()
         self._forget_report()
         self._set_link_status("Reconnecting…", "orange")
@@ -1419,22 +1500,26 @@ class ProcessMonitorWindow(QMainWindow):
         self._apply_report_state()
 
     def _send_cmd(self, cmd: CommandEnum, name: str):
-        reply = QMessageBox.question(
-            self,
-            f"Confirm {cmd.name.title()}",
-            f"Are you sure you want to <b>{cmd.name.lower()}</b> process "
-            f"<b>{name}</b>?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
+        """A command for one process, for every service ("*") or, for reload,
+        for the manager itself (an empty name). The manager's reply lands in
+        the status bar through the worker."""
+        question = command_question(cmd, name)
+        if question is not None:
+            reply = QMessageBox.question(
+                self,
+                question[0],
+                question[1],
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         if not getattr(self, "worker", None) or not self._link_up:
             self._show_status("Not connected — command not sent")
             return
         self.worker.send_command(cmd, name, args="")
         # The worker reports "Sent …" once the command is actually handed off.
-        self._show_status(f"Sending {cmd.name} for {name}…")
+        self._show_status(f"Sending {command_label(cmd, name)}…")
 
     def closeEvent(self, event):
         for w in list(self._log_windows.values()):
@@ -1471,25 +1556,32 @@ def main():
     )
     parser.add_argument(
         "--sub",
-        default=DEFAULT_SUB_ENDPOINT,
-        help=f"ZMQ SUB endpoint for the health report (default: {DEFAULT_SUB_ENDPOINT})",
+        help=f"ZMQ SUB endpoint for the health report (default: the one used last time, else {DEFAULT_SUB_ENDPOINT})",
     )
     parser.add_argument(
         "--dealer",
-        default=DEFAULT_DEALER_ENDPOINT,
-        help=f"ZMQ DEALER endpoint for commands (default: {DEFAULT_DEALER_ENDPOINT})",
+        help=f"ZMQ DEALER endpoint for commands (default: the one used last time, else {DEFAULT_DEALER_ENDPOINT})",
     )
     parser.add_argument(
         "--report",
-        default=DEFAULT_REPORT_ENDPOINT,
-        help=f"ZMQ SUB endpoint for the detailed report (default: {DEFAULT_REPORT_ENDPOINT})",
+        help=f"ZMQ SUB endpoint for the detailed report (default: the one used last time, else {DEFAULT_REPORT_ENDPOINT})",
+    )
+    parser.add_argument(
+        "--no-remember",
+        action="store_true",
+        help="neither read nor store the endpoints used last time",
     )
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
     apply_dark_theme(app)
 
-    win = ProcessMonitorWindow(args.sub, args.dealer, report_endpoint=args.report)
+    settings = None if args.no_remember else open_settings()
+    stored = stored_endpoints(settings) if settings is not None else {}
+    sub, dealer, report = resolve_endpoints(
+        {"sub": args.sub, "dealer": args.dealer, "report": args.report}, stored
+    )
+    win = ProcessMonitorWindow(sub, dealer, report_endpoint=report, settings=settings)
     win.show()
     sys.exit(app.exec())
 

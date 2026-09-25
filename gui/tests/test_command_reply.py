@@ -1,8 +1,10 @@
 from health_structs import (
+    ALL_SERVICES,
     REPLY_SIZE,
     CommandEnum,
     CommandResult,
     describe_reply,
+    make_command_message,
     make_command_reply,
     parse_command_reply,
     parse_health_reports,
@@ -47,12 +49,12 @@ def test_parse_reply_rejects_other_messages():
 
 def test_unknown_codes_are_kept_as_numbers():
     reply = parse_command_reply([b"BPM", make_command_reply(99, CommandResult.OK, "c")])
-    raw = bytearray(make_command_reply(90, CommandResult.OK, "c"))
+    raw = bytearray(make_command_reply(99, CommandResult.OK, "c"))
     raw[1] = 42
     odd = parse_command_reply([b"BPM", bytes(raw)])
     assert reply["command"] == 99
     assert odd["result"] == 42
-    assert describe_reply(odd) == "command 90 c: result 42"
+    assert describe_reply(odd) == "command 99 c: result 42"
 
 
 def test_describe_reply_reads_like_the_cli():
@@ -68,3 +70,23 @@ def test_describe_reply_reads_like_the_cli():
 
 def test_empty_count_prefixed_health_array_is_empty():
     assert parse_health_reports(b"\x00\x00\x00\x00") == []
+
+
+def test_reload_and_heartbeat_are_the_managers_codes():
+    # manager/include/CommandMessage.hpp: heartbeat 90, reload 91, "*" for every service
+    assert int(CommandEnum.HEARTBEAT) == 90 and int(CommandEnum.RELOAD) == 91
+    assert ALL_SERVICES == "*"
+    raw = make_command_message(CommandEnum.RELOAD, "")
+    assert raw[0] == 91 and raw[1:33] == bytes(32)
+    raw = make_command_message(CommandEnum.STOP, ALL_SERVICES)
+    assert raw[0] == 79 and raw[1:3] == b"*\x00"
+
+
+def test_describe_reply_for_whole_manager_commands():
+    reload = parse_command_reply([b"BPM", make_command_reply(91, CommandResult.OK, "", "1 added, 0 removed, 2 changed")])
+    assert describe_reply(reload) == "reload: ok (1 added, 0 removed, 2 changed)"
+    failed = parse_command_reply([b"BPM", make_command_reply(91, CommandResult.RELOAD_FAILED, "", "line 7: unknown key")])
+    assert describe_reply(failed) == "reload: reload failed (line 7: unknown key)"
+    assert not reply_succeeded(failed)
+    everything = parse_command_reply([b"BPM", make_command_reply(79, CommandResult.OK, "*", "stop sent to 3 services")])
+    assert describe_reply(everything) == "stop *: ok (stop sent to 3 services)"

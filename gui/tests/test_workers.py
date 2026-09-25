@@ -35,6 +35,7 @@ def link_window(**extra):
         _refresh_feed_status=lambda: None,
         _set_link_status=lambda *args: None,
         btn_connection=SimpleNamespace(setChecked=lambda on: None),
+        service_page=SimpleNamespace(set_link_up=lambda up: None),
     )
     for key, value in extra.items():
         setattr(window, key, value)

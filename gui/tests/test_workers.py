@@ -92,7 +92,7 @@ def test_reconnect_forgets_cpu_baselines_and_the_link():
 
 
 def test_a_report_fills_the_pages_and_the_gpu_source():
-    shown, greyed, details = [], [], []
+    shown, greyed, details, fed = [], [], [], []
     window = SimpleNamespace(
         _report=None,
         _report_at=None,
@@ -103,12 +103,13 @@ def test_a_report_fills_the_pages_and_the_gpu_source():
         service_page=SimpleNamespace(show_report=shown.append, set_report_stale=greyed.append),
         _refresh_gpu_status=lambda: None,
         _refresh_detail=lambda: details.append(True),
+        _on_feed=lambda snapshot, from_report: fed.append((snapshot, from_report)),
     )
     for name in ("_report_current", "_report_age_stale", "_details_for", "_manager_gpu", "_apply_report_state"):
         setattr(window, name, MethodType(getattr(pmg.ProcessMonitorWindow, name), window))
-    report = {"gpuMonitoring": True, "services": [{"name": "svc", "gpuValid": True}]}
+    report = {"gpuMonitoring": True, "snapshotTime": 5, "services": [{"name": "svc", "gpuValid": True}]}
     pmg.ProcessMonitorWindow._on_report(window, report)
-    assert shown == [report] and greyed == [False] and details
+    assert shown == [report] and fed == [(5, True)]
     assert window._details_for("svc") == {"name": "svc", "gpuValid": True}
     assert window._manager_gpu()
 

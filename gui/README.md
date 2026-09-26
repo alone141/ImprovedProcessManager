@@ -5,9 +5,9 @@ A GUI for monitoring and controlling services run by a central process manager o
 ## Features
 
 - **Real-time monitoring** via PUB-SUB (data broadcast from your process manager). The toolbar pill shows whether reports are actually arriving (`Live`, `Waiting for data…`, `No data for 12s`); when they stop, the last values are greyed out
-- **Master-detail layout** — the sidebar lists `berayprocessmanager` and every reported process (state dot, live CPU % or a missed-beats badge; type in the filter box to narrow it). The pane on the right shows the selection
+- **Master-detail layout** — the sidebar lists `berayprocessmanager` and every reported process (state dot, live CPU %, or a badge for missed beats, a failed service or the countdown to a restart; type in the filter box to narrow it). The pane on the right shows the selection
 - **Detailed report** — the GUI also subscribes to the manager's report on port 6668: per-service GPU figures measured on the manager's host, threads, open files, I/O, exit codes, limits, and the host's own CPU, memory, load and GPUs. Without it (an older manager, or the port out of reach) everything else works as before and the pages say so
-- **Process page** — state pill, **Start / Stop / Restart** (DEALER socket, talks to the manager's ROUTER; the manager's reply, such as `restart vision: ok (restarting)` or `start ghost: unknown service`, appears in the status bar), PID / uptime / heartbeat age, six metric tiles (CPU %, memory, **GPU %** and **VRAM** from the manager's report, or from local nvidia-smi joined by PID without it, missed beats, restarts), a **Details** panel from the report (the manager's own state, binary, restart policy, last exit, next restart, threads, open files, I/O, peak memory, limits, accounting, heartbeat) and a **state band** over the last 15 minutes
+- **Process page** — state pill (the manager's eight states: running, starting, waiting for a dependency, backoff with the time to its restart, unhealthy, failed, stopping, stopped; hover for what each means), **Start / Stop / Restart** (DEALER socket, talks to the manager's ROUTER; the manager's reply, such as `restart vision: ok (restarting)` or `start ghost: unknown service`, appears in the status bar), PID / uptime / heartbeat age, six metric tiles (CPU %, memory, **GPU %** and **VRAM** from the manager's report, or from local nvidia-smi joined by PID without it, missed beats, restarts), a **Details** panel from the report (the manager's own state, binary, restart policy, last exit, next restart, threads, open files, I/O, peak memory, limits, accounting, heartbeat) and a **state band** over the last 15 minutes (states on their way to another are striped; hover for the legend)
 - **Graphs tab** — CPU %, memory, GPU % and VRAM for the selected process over the last 1/5/15 minutes; hover to read values, tick other processes under *Compare* to overlay them, *Pop out* opens the graphs in their own window. Recording starts with the GUI (one sample a second, 15 minutes kept), so the recent past is there when you look
 - **cgroup PIDs tab** — the PIDs in `task_<name>/cgroup.procs` with comm, RSS and command line; double-click one for its `journalctl _PID=` window
 - **Journal tab** — live `journalctl _SYSTEMD_CGROUP=…/task_<name>`, lines coloured by PID
@@ -26,9 +26,9 @@ Packages: PyQt6, pyzmq only. GPU tiles use the manager's figures, or **local nvi
 
 ## GPU tiles
 
-The manager measures GPU use itself (NVML on its host, summed over each service's processes) and publishes it in the detailed report. While that report arrives, the tiles and the graphs use it and the toolbar pill reads `GPU · manager`; this is the only source that is right when the GUI runs on another machine.
+The manager measures GPU use itself (NVML on its host, summed over each service's processes) and publishes it in the detailed report. While that report arrives, the tiles and the graphs use it, the toolbar pill reads `GPU · manager`, and the GUI does not run nvidia-smi at all; this is the only source that is right when the GUI runs on another machine.
 
-Without it, the GUI samples **local** NVIDIA GPU usage via **nvidia-smi** and joins by **PID** from health reports (pill `GPU · nvidia-smi`). VRAM comes from compute apps (CUDA processes in v1). GPU % is shown when `pmon` provides it; otherwise the tile shows "—". Multi-GPU usage is summed per process. With neither source, the GPU tiles show "—" and the pill reads `GPU unavailable`.
+Only when the manager measures no GPU use (its report says so, or no report arrives within a few seconds of connecting; until then the pill reads `GPU · waiting`) does the GUI sample **local** NVIDIA GPU usage via **nvidia-smi** and join it by **PID** (pill `GPU · nvidia-smi`). VRAM comes from compute apps (CUDA processes in v1). GPU % is shown when `pmon` provides it; otherwise the tile shows "—". Multi-GPU usage is summed per process. With neither source, the GPU tiles show "—" and the pill reads `GPU unavailable`, with the reason in its tooltip.
 
 ## Manager page
 
@@ -114,10 +114,13 @@ Rules of thumb:
 └──────────────────────────┘ ──────────────────────────▶ └──────────────────────┘
 ```
 
-The GUI reads the simplified health report (one 128-byte record per service)
-and the detailed report on port 6668 (per-service GPU, threads, open files,
-I/O, exit codes, host figures: the same report `berayprocessmanager --status`
-shows), and sends `CommandMessage`s.
+The GUI shows what the detailed report on port 6668 says (the manager's eight
+states, its CPU and GPU figures, threads, open files, I/O, exit codes, host
+figures: the same report `berayprocessmanager --status` shows), and sends
+`CommandMessage`s. When no detailed report arrives (an older manager, or the
+port out of reach), it falls back to the simplified health report on port
+6667 (one 128-byte record per service, five states, CPU % worked out from two
+records), as it did before the detailed report existed.
 
 ## Protocol
 

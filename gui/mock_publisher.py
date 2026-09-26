@@ -12,6 +12,11 @@ ROUTER (bind) – accepts DEALER commands with:
   start / stop / restart of one service or of "*" (every service), heartbeat,
   and reload (91), which the mock only counts.
 
+The services go through the manager's eight states: a crash is restarted
+after a doubling delay (backoff) until the restart budget is used up (failed),
+a stop passes through stopping, and path_planner waits for sensor_fusion.
+The health record carries them folded into its five, as the manager does.
+
 The simulation lives in MockManager, so tests can drive it without sockets.
 """
 
@@ -71,16 +76,30 @@ HEARTBEAT_USERS = ("vision_pipeline", "control_loop")
 MEMORY_LIMITS = {"sensor_fusion": GB, "vision_pipeline": 2 * GB}
 CPU_LIMITS = {"sensor_fusion": 200}
 EXIT_CODES = (1, 3, -9, -11)
+# A service that waits for another, so waiting (and failing along) shows up.
+DEPENDS_ON = {"path_planner": ("sensor_fusion",)}
 
-# The GUI's five states to the manager's eight (the report's state byte).
-MANAGER_STATE = {
-    RuntimeState.UNKNOWN: ServiceState.STOPPED,
-    RuntimeState.STARTING: ServiceState.STARTING,
-    RuntimeState.RUNNING: ServiceState.RUNNING,
-    RuntimeState.STOPPED: ServiceState.STOPPED,
-    RuntimeState.UNHEALTHY: ServiceState.UNHEALTHY,
+# The manager's defaults (manager/README.md): the restart delay doubles from
+# 1 s up to 30 s, and 5 automatic restarts within 60 s make a service failed.
+RESTART_DELAY_NS = 1 * SEC
+RESTART_DELAY_MAX_NS = 30 * SEC
+MAX_RESTARTS = 5
+RESTART_WINDOW_NS = 60 * SEC
+
+# States with a live process, and so a PID and figures.
+ALIVE = (ServiceState.STARTING, ServiceState.RUNNING, ServiceState.UNHEALTHY, ServiceState.STOPPING)
+
+# The manager's eight states folded into the health record's five (docs/protocol.md).
+HEALTH_STATE = {
+    ServiceState.STOPPED: RuntimeState.STOPPED,
+    ServiceState.STOPPING: RuntimeState.STOPPED,
+    ServiceState.WAITING: RuntimeState.STARTING,
+    ServiceState.STARTING: RuntimeState.STARTING,
+    ServiceState.BACKOFF: RuntimeState.STARTING,
+    ServiceState.RUNNING: RuntimeState.RUNNING,
+    ServiceState.UNHEALTHY: RuntimeState.UNHEALTHY,
+    ServiceState.FAILED: RuntimeState.UNHEALTHY,
 }
-ALIVE = (RuntimeState.STARTING, RuntimeState.RUNNING, RuntimeState.UNHEALTHY)
 
 
 def make_report(
@@ -139,7 +158,10 @@ class MockManager:
         self.interval_ms = interval_ms
         self.started_ns = now
         self.last_snap = now
-        self.state: Dict[str, RuntimeState] = {n: RuntimeState.RUNNING for n in self.names}
+        self.state: Dict[str, ServiceState] = {n: ServiceState.RUNNING for n in self.names}
+        self.next_restart: Dict[str, int] = {n: 0 for n in self.names}  # while in backoff
+        # Automatic restarts within the restart window: the budget.
+        self.restart_times: Dict[str, List[int]] = {n: [] for n in self.names}
         self.pid: Dict[str, int] = {n: 10000 + i for i, n in enumerate(self.names)}
         self.start_ns: Dict[str, int] = {
             n: now - self.rng.randint(60, 3600) * SEC for n in self.names
@@ -188,47 +210,91 @@ class MockManager:
 
     def _apply(self, command: CommandEnum, name: str, now_ns: int) -> str:
         if command == CommandEnum.START:
-            self._start(name, now_ns)
-            return "starting"
+            self.restart_times[name].clear()  # a start by hand resets the budget
+            return self._start(name, now_ns)
         if command == CommandEnum.STOP:
-            self._stop(name, now_ns, -15)
-            return "stopped"
+            return self._stop(name, now_ns, -15)
         self._stop(name, now_ns, -15)
         self.restarts[name] += 1
+        self.restart_times[name].clear()
         self._start(name, now_ns)
         return "restarting"
 
-    def _start(self, name: str, now_ns: int) -> None:
-        self.state[name] = RuntimeState.STARTING
+    def _start(self, name: str, now_ns: int) -> str:
+        """Start now, or wait while a dependency is not running."""
         self.missed[name] = 0
+        waiting_for = [d for d in DEPENDS_ON.get(name, ()) if self.state[d] != ServiceState.RUNNING]
+        if waiting_for:
+            self.state[name] = ServiceState.WAITING
+            self.pid[name] = 0
+            return "waiting for " + ", ".join(waiting_for)
+        self._launch(name, now_ns)
+        return "starting"
 
-    def _stop(self, name: str, now_ns: int, code: int) -> None:
+    def _launch(self, name: str, now_ns: int) -> None:
+        self.state[name] = ServiceState.STARTING
+        self.pid[name] = self.rng.randint(10000, 20000)
+        self.start_ns[name] = now_ns
+        self.threads[name] = self.rng.randint(2, 40)
+
+    def _stop(self, name: str, now_ns: int, code: int) -> str:
+        """A live process exits at the next tick (stopping); anything else
+        (waiting, backoff, failed) stops at once."""
+        if self.state[name] == ServiceState.STOPPING:
+            return "stopping"
         if self.state[name] in ALIVE:
             self.last_exit[name] = (code, now_ns)
-        self.state[name] = RuntimeState.STOPPED
+            self.state[name] = ServiceState.STOPPING
+            return "stopping"
+        self.state[name] = ServiceState.STOPPED
         self.pid[name] = 0
+        return "stopped"
+
+    def crash(self, name: str, now_ns: int, code: int) -> None:
+        """The process exited on its own: restart it after a delay that doubles
+        with each restart in the window, or give up once the budget is used."""
+        self.last_exit[name] = (code, now_ns)
+        self.pid[name] = 0
+        recent = [t for t in self.restart_times[name] if now_ns - t <= RESTART_WINDOW_NS]
+        self.restart_times[name] = recent
+        if len(recent) >= MAX_RESTARTS:
+            self.state[name] = ServiceState.FAILED
+            return
+        self.state[name] = ServiceState.BACKOFF
+        self.next_restart[name] = now_ns + min(RESTART_DELAY_NS * 2 ** len(recent), RESTART_DELAY_MAX_NS)
 
     # ── simulation ────────────────────────────────────────────────────────
 
     def advance(self, now_ns: int) -> None:
-        """One tick: random state changes and growing counters."""
+        """One tick: random state changes, due restarts and growing counters."""
         rng = self.rng
         for name in self.names:
-            if self.state[name] == RuntimeState.STARTING and rng.random() < 0.3:
-                self.state[name] = RuntimeState.RUNNING
-                self.pid[name] = rng.randint(10000, 20000)
-                self.start_ns[name] = now_ns  # restarts were counted at the command
-                self.threads[name] = rng.randint(2, 40)
-            elif self.state[name] == RuntimeState.RUNNING and rng.random() < 0.01:
-                self.state[name] = RuntimeState.UNHEALTHY
+            state = self.state[name]
+            if state == ServiceState.STARTING and rng.random() < 0.3:
+                self.state[name] = ServiceState.RUNNING
+            elif state == ServiceState.RUNNING and rng.random() < 0.01:
+                self.state[name] = ServiceState.UNHEALTHY
                 self.missed[name] += 1
-            elif self.state[name] == RuntimeState.UNHEALTHY and rng.random() < 0.05:
-                self._stop(name, now_ns, rng.choice(EXIT_CODES))
+            elif state == ServiceState.UNHEALTHY and rng.random() < 0.05:
+                self.crash(name, now_ns, rng.choice(EXIT_CODES))
+            elif state == ServiceState.STOPPING:
+                self.state[name] = ServiceState.STOPPED
+                self.pid[name] = 0
+            elif state == ServiceState.BACKOFF and now_ns >= self.next_restart[name]:
+                self.restart_times[name].append(now_ns)
+                self.restarts[name] += 1
+                self._start(name, now_ns)
+            elif state == ServiceState.WAITING:
+                dependencies = [self.state[d] for d in DEPENDS_ON.get(name, ())]
+                if ServiceState.FAILED in dependencies:
+                    self.state[name] = ServiceState.FAILED  # the manager stops waiting
+                elif all(d == ServiceState.RUNNING for d in dependencies):
+                    self._launch(name, now_ns)
 
         elapsed_us = (now_ns - self.last_snap) / 1000.0
         for name in self.names:
             alive = self.state[name] in ALIVE
-            load = rng.uniform(0.05, 0.6) if self.state[name] == RuntimeState.RUNNING else 0.0
+            load = rng.uniform(0.05, 0.6) if self.state[name] == ServiceState.RUNNING else 0.0
             self.cpu_usec[name] += int(elapsed_us * load)
             self.cpu_pct[name] = load * 100.0
             if alive:
@@ -243,7 +309,7 @@ class MockManager:
                         min(100.0, max(0.0, util + rng.uniform(-5, 5))),
                         max(50 * MB, vram + rng.randint(-10 * MB, 10 * MB)),
                     )
-            if self.state[name] == RuntimeState.RUNNING:
+            if self.state[name] == ServiceState.RUNNING:
                 self.last_seen[name] = now_ns - rng.randint(0, 200_000_000)
         self.host_cpu = min(100.0, max(0.0, self.host_cpu + rng.uniform(-3, 3)))
         self.host_memory_available = min(
@@ -257,14 +323,15 @@ class MockManager:
     def health_reports(self, now_ns: int) -> List[DetailedHealthReport]:
         reports = []
         for name in self.names:
+            state = HEALTH_STATE[self.state[name]]
             last_seen = self.last_seen[name]
-            if self.state[name] in (RuntimeState.UNKNOWN, RuntimeState.STOPPED, RuntimeState.UNHEALTHY):
+            if state in (RuntimeState.STOPPED, RuntimeState.UNHEALTHY):
                 last_seen = self.start_ns[name]
             reports.append(
                 make_report(
                     name=name,
                     pid=self.pid[name],
-                    state=self.state[name],
+                    state=state,
                     mem=self.mem[name],
                     cpu_usec=self.cpu_usec[name],
                     start_ns=self.start_ns[name],
@@ -289,7 +356,7 @@ class MockManager:
                 "binary": f"/opt/beray/bin/{name}",
                 "description": DESCRIPTIONS.get(name, ""),
                 "pid": self.pid[name] if alive else 0,
-                "state": MANAGER_STATE[state],
+                "state": state,
                 "restartMode": RestartMode.ON_FAILURE,
                 "autostart": True,
                 "heartbeat": name in HEARTBEAT_USERS,
@@ -305,7 +372,7 @@ class MockManager:
                 "startTime": self.start_ns[name] if alive else 0,
                 "lastSeen": self.last_seen[name],
                 "lastExitTime": exit_time,
-                "nextRestartTime": 0,
+                "nextRestartTime": self.next_restart[name] if state == ServiceState.BACKOFF else 0,
                 "cpuTimeUsec": self.cpu_usec[name],
                 "cpuPercent": self.cpu_pct[name] if alive else None,
                 "memoryBytes": self.mem[name] if alive else 0,

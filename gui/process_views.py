@@ -15,6 +15,7 @@ import bisect
 import html
 import re
 import time
+from enum import IntEnum
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, pyqtSignal
@@ -25,6 +26,7 @@ from PyQt6.QtGui import (
     QPainter,
     QPainterPath,
     QPalette,
+    QPen,
     QTextOption,
 )
 from PyQt6.QtWidgets import (
@@ -96,23 +98,123 @@ TEXT_MUTED = "#888888"
 DANGER = "#f44336"
 STALE_COLOR = QColor("#777777")
 
-STATE_COLORS: Dict[RuntimeState, str] = {
-    RuntimeState.UNKNOWN: "#9c27b0",
-    RuntimeState.STARTING: "#ff9800",
-    RuntimeState.RUNNING: "#4caf50",
-    RuntimeState.STOPPED: "#9e9e9e",
-    RuntimeState.UNHEALTHY: "#f44336",
+
+class DisplayState(IntEnum):
+    """The state the pages show: the manager's eight (the ServiceState values
+    of the detailed report), and UNKNOWN, which only a manager that sends
+    nothing but the health record's five states can leave us with."""
+
+    STOPPED = 0
+    WAITING = 1
+    STARTING = 2
+    RUNNING = 3
+    UNHEALTHY = 4
+    STOPPING = 5
+    BACKOFF = 6
+    FAILED = 7
+    UNKNOWN = -1
+
+
+# The health record says less: each of its five states stands for one of ours.
+_FROM_RUNTIME: Dict[RuntimeState, DisplayState] = {
+    RuntimeState.UNKNOWN: DisplayState.UNKNOWN,
+    RuntimeState.STARTING: DisplayState.STARTING,
+    RuntimeState.RUNNING: DisplayState.RUNNING,
+    RuntimeState.STOPPED: DisplayState.STOPPED,
+    RuntimeState.UNHEALTHY: DisplayState.UNHEALTHY,
 }
-STATE_LABELS: Dict[RuntimeState, str] = {
-    RuntimeState.UNKNOWN: "Unknown",
-    RuntimeState.STARTING: "Starting",
-    RuntimeState.RUNNING: "Running",
-    RuntimeState.STOPPED: "Stopped",
-    RuntimeState.UNHEALTHY: "Unhealthy",
+
+# How the manager folds its eight states into the health record's five
+# (docs/protocol.md). The buttons follow it, so they allow what they did when
+# only the five were known.
+_FOLD: Dict[DisplayState, RuntimeState] = {
+    DisplayState.UNKNOWN: RuntimeState.UNKNOWN,
+    DisplayState.STOPPED: RuntimeState.STOPPED,
+    DisplayState.STOPPING: RuntimeState.STOPPED,
+    DisplayState.WAITING: RuntimeState.STARTING,
+    DisplayState.STARTING: RuntimeState.STARTING,
+    DisplayState.BACKOFF: RuntimeState.STARTING,
+    DisplayState.RUNNING: RuntimeState.RUNNING,
+    DisplayState.UNHEALTHY: RuntimeState.UNHEALTHY,
+    DisplayState.FAILED: RuntimeState.UNHEALTHY,
 }
+
+
+def display_state(state) -> DisplayState:
+    """The display state of either feed's state: a ServiceState from the
+    detailed report, a RuntimeState from the health record, or one already."""
+    if isinstance(state, DisplayState):
+        return state
+    if isinstance(state, ServiceState):
+        return DisplayState(int(state))
+    if isinstance(state, RuntimeState):
+        return _FROM_RUNTIME[state]
+    return DisplayState.UNKNOWN
+
+
+def stored_state(value: int) -> DisplayState:
+    """A display state kept as a plain int (the usage history's samples)."""
+    try:
+        return DisplayState(value)
+    except ValueError:
+        return DisplayState.UNKNOWN
+
+
+# The five the health record knows keep their colours. The four only the
+# detailed report has were checked for contrast on the tiles and for distance
+# from the states they sit next to in the state band.
+STATE_COLORS: Dict[DisplayState, str] = {
+    DisplayState.UNKNOWN: "#9c27b0",
+    DisplayState.STOPPED: "#9e9e9e",
+    DisplayState.WAITING: "#03a9f4",
+    DisplayState.STARTING: "#ff9800",
+    DisplayState.RUNNING: "#4caf50",
+    DisplayState.UNHEALTHY: "#f44336",
+    DisplayState.STOPPING: "#cfd8dc",
+    DisplayState.BACKOFF: "#ffe57f",
+    DisplayState.FAILED: "#ea80fc",
+}
+STATE_LABELS: Dict[DisplayState, str] = {
+    DisplayState.UNKNOWN: "Unknown",
+    DisplayState.STOPPED: "Stopped",
+    DisplayState.WAITING: "Waiting",
+    DisplayState.STARTING: "Starting",
+    DisplayState.RUNNING: "Running",
+    DisplayState.UNHEALTHY: "Unhealthy",
+    DisplayState.STOPPING: "Stopping",
+    DisplayState.BACKOFF: "Backoff",
+    DisplayState.FAILED: "Failed",
+}
+STATE_MEANINGS: Dict[DisplayState, str] = {
+    DisplayState.RUNNING: "running",
+    DisplayState.STARTING: "started, not yet counted as running",
+    DisplayState.WAITING: "waiting for the services it depends on",
+    DisplayState.BACKOFF: "exited; the manager restarts it after a delay",
+    DisplayState.UNHEALTHY: "running, but its heartbeats are missing",
+    DisplayState.FAILED: (
+        "will not be restarted: it exited with an error its restart policy does not "
+        "cover, used up its restarts, or a service it depends on failed; Start tries again"
+    ),
+    DisplayState.STOPPING: "asked to stop; its processes are exiting",
+    DisplayState.STOPPED: "not running",
+    DisplayState.UNKNOWN: "the manager did not say",
+}
+# States on their way to another one. The state band stripes them, so they
+# differ from their neighbours by more than colour.
+TRANSITIONAL_STATES = (
+    DisplayState.WAITING,
+    DisplayState.STARTING,
+    DisplayState.STOPPING,
+    DisplayState.BACKOFF,
+)
 # States with a live process, where an uptime means something.
-ALIVE_STATES = (RuntimeState.STARTING, RuntimeState.RUNNING, RuntimeState.UNHEALTHY)
-# Which command makes sense in which state.
+ALIVE_STATES = (
+    DisplayState.STARTING,
+    DisplayState.RUNNING,
+    DisplayState.UNHEALTHY,
+    DisplayState.STOPPING,
+)
+# Which command makes sense in which of the health record's states.
 ACTION_STATES: Dict[CommandEnum, Tuple[RuntimeState, ...]] = {
     CommandEnum.START: (RuntimeState.STOPPED, RuntimeState.UNKNOWN, RuntimeState.UNHEALTHY),
     CommandEnum.STOP: (RuntimeState.RUNNING, RuntimeState.STARTING, RuntimeState.UNHEALTHY),
@@ -198,8 +300,44 @@ def mono_style(color: str) -> str:
 # ── pure helpers ─────────────────────────────────────────────────────────────
 
 
-def state_color(state: RuntimeState) -> str:
-    return STATE_COLORS.get(state, "#ffffff")
+def state_color(state) -> str:
+    return STATE_COLORS[display_state(state)]
+
+
+def restart_wait_ns(report: dict) -> int:
+    """How long until the scheduled restart of a service in backoff, as of the
+    snapshot, rounded up to a whole second, so a countdown never reads 0s
+    while the restart is still to come; 0 when none is scheduled (or only the
+    health record is known)."""
+    wait = int(report.get("nextRestartTime", 0) or 0) - int(report.get("snapshotTime", 0) or 0)
+    second = 1_000_000_000
+    return -(-wait // second) * second if wait > 0 else 0
+
+
+def state_text(report: dict) -> str:
+    """The state pill's text: the state, with the backoff countdown."""
+    state = display_state(report.get("state"))
+    wait = restart_wait_ns(report) if state == DisplayState.BACKOFF else 0
+    return STATE_LABELS[state] + (f" {format_duration_short(wait)}" if wait else "")
+
+
+def state_tooltip(state) -> str:
+    state = display_state(state)
+    return f"{STATE_LABELS[state]}: {STATE_MEANINGS[state]}"
+
+
+def state_legend_html() -> str:
+    """What the state colours mean, for tooltips."""
+    rows = "".join(
+        f"<tr><td style='color: {STATE_COLORS[state]}'>&#9632;</td>"
+        f"<td><b>{STATE_LABELS[state].lower()}</b></td><td>{html.escape(meaning)}</td></tr>"
+        for state, meaning in STATE_MEANINGS.items()
+    )
+    return (
+        "Process state over the last 15 minutes; a hole means no reports. "
+        "Striped: on its way to another state."
+        f"<table cellspacing='4'>{rows}</table>"
+    )
 
 
 def tint(color: str, alpha: float = 0.18) -> str:
@@ -212,6 +350,33 @@ def pill_style(color: str) -> str:
     radius = max(6, int(ui_point_size() * 0.9))
     return (
         f"QLabel {{ color: {color}; background: {tint(color)}; "
+        f"border-radius: {radius}px; padding: 1px {radius}px; font-weight: bold; }}"
+    )
+
+
+def _luminance(color: QColor) -> float:
+    """WCAG relative luminance."""
+
+    def channel(value: int) -> float:
+        v = value / 255.0
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+
+    return 0.2126 * channel(color.red()) + 0.7152 * channel(color.green()) + 0.0722 * channel(color.blue())
+
+
+def ink_for(color: str) -> str:
+    """Black or white, whichever reads better on ``color``."""
+    lum = _luminance(QColor(color))
+    return "#000000" if (lum + 0.05) / 0.05 >= 1.05 / (lum + 0.05) else "#ffffff"
+
+
+def solid_pill_style(color: str) -> str:
+    """A pill filled with ``color``: it reads the same on the light page and on
+    a dark one, whatever the colour (text in its colour would not, for the pale
+    ones)."""
+    radius = max(6, int(ui_point_size() * 0.9))
+    return (
+        f"QLabel {{ color: {ink_for(color)}; background: {color}; "
         f"border-radius: {radius}px; padding: 1px {radius}px; font-weight: bold; }}"
     )
 
@@ -232,13 +397,13 @@ def segment_style(first: bool, last: bool) -> str:
     )
 
 
-def action_enabled(command: CommandEnum, state: RuntimeState) -> bool:
-    return state in ACTION_STATES[command]
+def action_enabled(command: CommandEnum, state) -> bool:
+    return _FOLD[display_state(state)] in ACTION_STATES[command]
 
 
-def uptime_text(state: RuntimeState, start_ns: int, snap_ns: int) -> str:
+def uptime_text(state, start_ns: int, snap_ns: int) -> str:
     # A stopped process keeps its last start time; that isn't an uptime.
-    if state not in ALIVE_STATES or not start_ns:
+    if display_state(state) not in ALIVE_STATES or not start_ns:
         return "—"
     return format_duration_ns(snap_ns - start_ns)
 
@@ -286,15 +451,21 @@ def gpu_texts(gpu) -> Tuple[str, str]:
 
 
 def row_hint(report: dict) -> Tuple[str, str]:
-    """Right-hand text of a sidebar row and its kind: "cpu", "badge" or "muted"."""
-    state = report["state"]
-    if state == RuntimeState.UNHEALTHY:
+    """Right-hand text of a sidebar row and its kind: "cpu", "badge" (in the
+    state's colour) or "muted"."""
+    state = display_state(report["state"])
+    if state == DisplayState.UNHEALTHY:
         missed = int(report.get("missedBeats", 0) or 0)
         return (f"{missed} missed" if missed else "unhealthy"), "badge"
-    if state == RuntimeState.RUNNING:
+    if state == DisplayState.FAILED:
+        return "failed", "badge"
+    if state == DisplayState.BACKOFF:
+        wait = restart_wait_ns(report)
+        return (f"restart in {format_duration_short(wait)}" if wait else "backoff"), "badge"
+    if state == DisplayState.RUNNING:
         cpu = report.get("_cpu_pct")
         return ("—" if cpu is None else f"{cpu:.0f} %"), "cpu"
-    return STATE_LABELS.get(state, state.name).lower(), "muted"
+    return STATE_LABELS[state].lower(), "muted"
 
 
 def service_active_text(status_text: str) -> str:
@@ -524,16 +695,17 @@ class SidebarDelegate(QStyledItemDelegate):
         elif option.state & QStyle.StateFlag.State_MouseOver:
             painter.fillRect(rect, QColor(ROW_HOVER_BG))
 
+        badge_color = QColor(DANGER)
         if kind == "manager":
             dot = QColor(ACCENT)
             hint, hint_kind = (index.data(HINT_ROLE) or ""), "muted"
             name_color = QColor(TEXT)
         else:
             report = index.data(REPORT_ROLE) or {}
-            state = report.get("state", RuntimeState.UNKNOWN)
-            dot = QColor(state_color(state))
+            state = display_state(report.get("state"))
+            dot = badge_color = QColor(state_color(state))
             hint, hint_kind = row_hint(report) if report else ("", "muted")
-            name_color = QColor(TEXT_DIM if state == RuntimeState.STOPPED else TEXT)
+            name_color = QColor(TEXT_DIM if state == DisplayState.STOPPED else TEXT)
         if self.stale:
             dot, name_color, hint_kind = STALE_COLOR, STALE_COLOR, "muted"
 
@@ -556,11 +728,11 @@ class SidebarDelegate(QStyledItemDelegate):
                 badge_h = hfm.height() + 2
                 hint_w = text_w + pad * 1.6
                 badge = QRectF(right - hint_w, cy - badge_h / 2, hint_w, badge_h)
-                fill = QColor(DANGER)
+                fill = QColor(badge_color)
                 fill.setAlpha(56)
                 painter.setBrush(fill)
                 painter.drawRoundedRect(badge, badge_h / 2, badge_h / 2)
-                painter.setPen(QColor(DANGER))
+                painter.setPen(badge_color)
                 painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, hint)
             else:
                 hint_w = text_w
@@ -932,12 +1104,16 @@ class StatePill(QLabel):
         super().__init__(parent)
         self.setFont(ui_font(0.95, QFont.Weight.Bold))
         self._color = STALE_COLOR.name()
-        self.set_state(RuntimeState.UNKNOWN)
+        self.set_state(DisplayState.UNKNOWN)
 
-    def set_state(self, state: RuntimeState, stale: bool = False) -> None:
-        self.setText(STATE_LABELS.get(state, state.name.title()))
+    def set_state(self, state, stale: bool = False, text: str = "") -> None:
+        """Show ``state`` (either feed's, or a DisplayState), as ``text`` when
+        given (the backoff countdown), else by its name."""
+        state = display_state(state)
+        self.setText(text or STATE_LABELS[state])
+        self.setToolTip(state_tooltip(state))
         self._color = STALE_COLOR.name() if stale else state_color(state)
-        self.setStyleSheet(pill_style(self._color))
+        self.setStyleSheet(solid_pill_style(self._color))
 
     def color(self) -> str:
         return self._color
@@ -954,7 +1130,7 @@ class StateBand(QWidget):
         self._since = 0.0
         self._now = 1.0
         self._stale = False
-        self.setToolTip("Process state over the last 15 minutes; a hole means no reports")
+        self.setToolTip(state_legend_html())
 
     def set_segments(
         self, segments: Sequence[Tuple[float, float, int]], since: float, now: float
@@ -980,15 +1156,34 @@ class StateBand(QWidget):
         p.fillPath(path, QColor(TILE_BG))
         p.setClipPath(path)
         span = max(self._now - self._since, 1e-9)
-        for start, end, state in self._segments:
+        for start, end, value in self._segments:
             x0 = (start - self._since) / span * rect.width()
             x1 = (end - self._since) / span * rect.width()
             if x1 - x0 < 1:
                 x1 = x0 + 1
-            color = QColor(state_color(RuntimeState.from_byte(state)))
+            state = stored_state(value)
+            color = QColor(state_color(state))
             if self._stale:
                 color.setAlpha(110)
-            p.fillRect(QRectF(x0, 0, x1 - x0, rect.height()), color)
+            segment = QRectF(x0, 0, x1 - x0, rect.height())
+            p.fillRect(segment, color)
+            if state in TRANSITIONAL_STATES:
+                self._stripe(p, segment)
+
+    @staticmethod
+    def _stripe(p: QPainter, segment: QRectF) -> None:
+        """Diagonal stripes over a segment, spaced by the band's height."""
+        height = segment.height()
+        p.save()
+        p.setClipRect(segment, Qt.ClipOperation.IntersectClip)
+        pen = QPen(QColor(0, 0, 0, 90))
+        pen.setWidthF(max(1.0, height / 5))
+        p.setPen(pen)
+        x = segment.left() - height
+        while x < segment.right():
+            p.drawLine(QPointF(x, segment.bottom()), QPointF(x + height, segment.top()))
+            x += height * 0.8
+        p.restore()
 
 
 class GraphsPanel(QWidget):
@@ -1279,7 +1474,7 @@ class ProcessDetailPage(QWidget):
             button.setMinimumWidth(width)
         root.addLayout(header)
 
-        self.lbl_meta = QLabel("Waiting for a health report…")
+        self.lbl_meta = QLabel("Waiting for a report…")
         self.lbl_meta.setStyleSheet(mono_style(TEXT_DIM))
         self.lbl_meta.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.lbl_meta.setWordWrap(True)
@@ -1366,8 +1561,8 @@ class ProcessDetailPage(QWidget):
 
     def update_report(self, report: dict, gpu) -> None:
         self.report = report
-        state: RuntimeState = report["state"]
-        self.pill.set_state(state, self._stale)
+        state = display_state(report["state"])
+        self.pill.set_state(state, self._stale, state_text(report))
         self.lbl_meta.setText(meta_text(report))
         gpu_pct, vram = gpu_texts(gpu)
         values = {
@@ -1385,8 +1580,8 @@ class ProcessDetailPage(QWidget):
 
     def _show_no_report(self) -> None:
         self.report = None
-        self.pill.set_state(RuntimeState.UNKNOWN, self._stale)
-        self.lbl_meta.setText("Waiting for a health report…")
+        self.pill.set_state(DisplayState.UNKNOWN, self._stale)
+        self.lbl_meta.setText("Waiting for a report…")
         for tile in self.tiles.values():
             tile.set_value("—")
         for button in self.buttons.values():
@@ -1419,8 +1614,10 @@ class ProcessDetailPage(QWidget):
         self._stale = stale
         for tile in self.tiles.values():
             tile.set_stale(stale)
-        state = self.report["state"] if self.report else RuntimeState.UNKNOWN
-        self.pill.set_state(state, stale)
+        if self.report:
+            self.pill.set_state(self.report["state"], stale, state_text(self.report))
+        else:
+            self.pill.set_state(DisplayState.UNKNOWN, stale)
         self.lbl_meta.setStyleSheet(mono_style(STALE_COLOR.name() if stale else TEXT_DIM))
         self.details.set_stale(stale)
         self.band.set_stale(stale)

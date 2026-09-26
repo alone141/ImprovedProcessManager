@@ -82,6 +82,7 @@ from process_views import (  # noqa: F401  re-exported
     ProcessDetailPage,
     ProcessSidebar,
     ServiceDetailPage,
+    display_state,
     mono_style,
     pill_style,
     service_active_text,
@@ -423,7 +424,9 @@ class SystemdLogWorker(QObject):
 
 
 class GpuSampleWorker(QObject):
-    """nvidia-smi sampling off the UI thread."""
+    """nvidia-smi sampling off the UI thread, while not paused. It starts
+    paused: the window runs it only when the manager measures no GPU use
+    itself, and nvidia-smi is not even probed before then."""
 
     sampled = pyqtSignal(object, object, bool)  # map, error_or_None, available
     finished = pyqtSignal()
@@ -431,25 +434,17 @@ class GpuSampleWorker(QObject):
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
         self._running = True  # until stop(); start() never re-arms it
+        self._paused = True  # set from the UI thread; a plain bool is enough
         self._sampler: Optional[GpuSampler] = None
+
+    def set_paused(self, paused: bool) -> None:
+        self._paused = paused
 
     @pyqtSlot()
     def start(self):
-        self._sampler = GpuSampler()
-        self._sampler.init()
         while self._running:
-            try:
-                if not self._sampler.available():
-                    self.sampled.emit({}, self._sampler.last_error(), False)
-                else:
-                    result = self._sampler.sample()
-                    err = None
-                    if self._sampler.last_error() and not result:
-                        err = self._sampler.last_error()
-                        result = {}
-                    self.sampled.emit(result, err, True)
-            except Exception as e:
-                self.sampled.emit({}, str(e), False)
+            if not self._paused:
+                self._sample()
             slept = 0
             while self._running and slept < 1000:
                 QThread.msleep(100)
@@ -457,6 +452,23 @@ class GpuSampleWorker(QObject):
         if self._sampler:
             self._sampler.shutdown()
         self.finished.emit()
+
+    def _sample(self) -> None:
+        try:
+            if self._sampler is None:
+                self._sampler = GpuSampler()
+                self._sampler.init()
+            if not self._sampler.available():
+                self.sampled.emit({}, self._sampler.last_error(), False)
+                return
+            result = self._sampler.sample()
+            err = None
+            if self._sampler.last_error() and not result:
+                err = self._sampler.last_error()
+                result = {}
+            self.sampled.emit(result, err, True)
+        except Exception as e:
+            self.sampled.emit({}, str(e), False)
 
     def stop(self):
         self._running = False
@@ -711,6 +723,36 @@ def cpu_percent(
     return min(delta_cpu / (delta_ns / 1000.0) * 100.0, CPU_PCT_MAX)
 
 
+def service_view(
+    health: Optional[dict], record: Optional[dict], report: Optional[dict]
+) -> dict:
+    """What the pages show for one service, in the health record's keys: from
+    the service's ``record`` of the manager's detailed ``report`` when there is
+    one, else from its ``health`` record. The state is a DisplayState either way,
+    and ``source`` says which feed it came from."""
+    if record is None or report is None:
+        view = dict(health or {})
+        view["state"] = display_state(view.get("state"))
+        view["source"] = "health"
+        return view
+    return {
+        "processName": record["name"],
+        "pid": int(record.get("pid", 0) or 0),
+        "state": display_state(record.get("state")),
+        "memoryUsageInBytes": int(record.get("memoryBytes", 0) or 0),
+        # The manager's own figure, over its publish interval: no second
+        # report needed, and the same number as the details panel.
+        "_cpu_pct": record.get("cpuPercent"),
+        "start_time": int(record.get("startTime", 0) or 0),
+        "lastSeen": int(record.get("lastSeen", 0) or 0),
+        "missedBeats": int(record.get("missedBeats", 0) or 0),
+        "restartCount": int(record.get("restartCount", 0) or 0),
+        "snapshotTime": int(report.get("snapshotTime", 0) or 0),
+        "nextRestartTime": int(record.get("nextRestartTime", 0) or 0),
+        "source": "report",
+    }
+
+
 class FeedMonitor:
     """Tells live health data from stale, from when reports arrive.
 
@@ -721,6 +763,7 @@ class FeedMonitor:
     def __init__(self) -> None:
         self.connected_at: Optional[float] = None
         self.last_report_at: Optional[float] = None
+        self._last_snapshot_at: Optional[float] = None
         self._gaps: Deque[float] = deque(maxlen=8)
 
     def on_connected(self, now: float) -> None:
@@ -730,9 +773,18 @@ class FeedMonitor:
     def on_disconnected(self) -> None:
         self.connected_at = None
 
-    def on_report(self, now: float) -> None:
-        if self._received_since_connect():
-            self._gaps.append(now - self.last_report_at)
+    def on_report(self, now: float, new_snapshot: bool = True) -> None:
+        """Data arrived. The manager sends each snapshot on two sockets (health
+        record and detailed report): both prove the feed live, only the first
+        of a snapshot counts toward the interval between reports."""
+        if new_snapshot:
+            if (
+                self.connected_at is not None
+                and self._last_snapshot_at is not None
+                and self._last_snapshot_at >= self.connected_at
+            ):
+                self._gaps.append(now - self._last_snapshot_at)
+            self._last_snapshot_at = now
         self.last_report_at = now
 
     def _received_since_connect(self) -> bool:
@@ -843,15 +895,26 @@ class ProcessMonitorWindow(QMainWindow):
         fit_to_screen(self, QSize(1180, 760), minimum=QSize(900, 600))
 
         self._prev: Dict[str, Tuple[int, int]] = {}   # name → (cpu_usec, snap_ns)
+        self._health: Dict[str, dict] = {}  # the latest health records, by name
+        # What the pages show, by name: the detailed report's records while it
+        # is current, else the health records (service_view).
         self._current: Dict[str, dict] = {}
+        self._feed_snapshot: Optional[int] = None  # the newest manager snapshot seen
+        # The last snapshot in the graphs: which, when, and from which socket.
+        self._recorded_snapshot: Optional[int] = None
+        self._recorded_at = 0.0
+        self._recorded_from_report = False
         self._gpu_by_pid: Dict[int, GpuProcessUsage] = {}
         self._log_windows: Dict[str, ProcessLogWindow] = {}
         self._cgroup_members: dict = {}
         self._feed = FeedMonitor()
         self._stale = False  # the pages show data that stopped updating
         self._link_status: Optional[Tuple[str, str, str]] = None
-        self._last_gpu_error: Optional[str] = None
-        self._gpu_error: Optional[str] = "GPU sampler starting…"
+        # This machine's nvidia-smi: only a fallback for a manager that measures
+        # no GPU use itself, so it waits for the first report (_update_gpu_sampler).
+        self._gpu_paused = True
+        self._gpu_wait_since = time.monotonic()
+        self._gpu_error: Optional[str] = None
         self._gpu_available = False
         self._gpu_status: Optional[Tuple[str, str, str]] = None
         # The detailed report (port 6668): the latest one, when it came, and
@@ -1115,9 +1178,7 @@ class ProcessMonitorWindow(QMainWindow):
         self._report_at = time.monotonic()
         self._report_services = {s["name"]: s for s in report.get("services", [])}
         self.service_page.show_report(report)
-        self._apply_report_state()
-        self._refresh_gpu_status()
-        self._refresh_detail()
+        self._on_feed(int(report.get("snapshotTime", 0) or 0), from_report=True)
 
     def _refresh_detail(self) -> None:
         name = self.detail.name
@@ -1257,30 +1318,69 @@ class ProcessMonitorWindow(QMainWindow):
 
     @pyqtSlot(list)
     def _on_reports(self, reports: List[dict]):
-        new_current: Dict[str, dict] = {}
+        """Health records: what the pages show when there is no current
+        detailed report (an older manager, or port 6668 out of reach)."""
+        health: Dict[str, dict] = {}
         for r in reports:
             name = r["processName"]
             r["_cpu_pct"] = cpu_percent(
                 self._prev.get(name), r["cpuUsageInUsec"], r["snapshotTime"]
             )
             self._prev[name] = (r["cpuUsageInUsec"], r["snapshotTime"])
-            new_current[name] = r
-
-        for gone in set(self._current) - set(new_current):
+            health[name] = r
+        for gone in set(self._health) - set(health):
             self._prev.pop(gone, None)
-        self._current = new_current
-        if getattr(self, "cgroup_members_worker", None):
-            self.cgroup_members_worker.set_names(sorted(self._current.keys()))
+        self._health = health
+        snapshot = reports[0]["snapshotTime"] if reports else None
+        self._on_feed(snapshot, from_report=False)
 
+    def _new_snapshot(self, snapshot: Optional[int]) -> bool:
+        """The first arrival of a manager snapshot. An empty health frame has no
+        time: it stands for a snapshot of its own only while no report is current."""
+        if snapshot is None:
+            return not self._report_current()
+        return snapshot != self._feed_snapshot
+
+    def _rebuild_view(self) -> None:
+        records = self._report_services if self._report_current() else {}
+        report = self._report if records else None
+        self._current = {
+            name: service_view(self._health.get(name), records.get(name), report)
+            for name in set(self._health) | set(records)
+        }
+
+    def _on_feed(self, snapshot: Optional[int], from_report: bool) -> None:
+        """Either socket delivered. Every arrival proves the feed live and
+        rebuilds what the pages show; the graphs take one sample per manager
+        snapshot, from the feed the pages are built from."""
         now = time.monotonic()
-        self._feed.on_report(now)
+        new = self._new_snapshot(snapshot)
+        if new and snapshot is not None:
+            self._feed_snapshot = snapshot
+        self._feed.on_report(now, new_snapshot=new)
         interval = self._feed.report_interval()
         if interval is not None:
             self._usage.set_report_interval(interval)
-        self._record_usage(now)
-        if self._stale:
-            self._stale = False
+        # Live again before the view is rebuilt: a stale feed keeps the last
+        # report on show (_report_current), a live one lets it lapse.
+        was_stale, self._stale = self._stale, False
+        self._rebuild_view()
+        if was_stale:
             self._apply_stale()
+        self._apply_report_state()
+        self._update_gpu_sampler()
+        if getattr(self, "cgroup_members_worker", None):
+            self.cgroup_members_worker.set_names(sorted(self._current.keys()))
+        if from_report == self._report_current():
+            if snapshot is None or snapshot != self._recorded_snapshot:
+                self._recorded_snapshot, self._recorded_at = snapshot, now
+                self._recorded_from_report = from_report
+                self._record_usage(now)
+            elif from_report and not self._recorded_from_report:
+                # This snapshot went into the graphs from its health records a
+                # moment ago, before a report counted; the report says more.
+                self._recorded_from_report = True
+                self._record_usage(now, replace_since=self._recorded_at)
         shown = self.detail.name
         if self.stack.currentWidget() is self.detail and shown and shown not in self._current:
             self.sidebar.select_manager()  # the shown process left the reports
@@ -1302,8 +1402,9 @@ class ProcessMonitorWindow(QMainWindow):
             self._auto_select = False
             self.sidebar.select_process(visible[0])
 
-    def _record_usage(self, now: float) -> None:
-        """Sample every process for the usage graphs and the state band."""
+    def _record_usage(self, now: float, replace_since: Optional[float] = None) -> None:
+        """Sample every process for the usage graphs and the state band (in
+        place of the samples taken since ``replace_since``, when given)."""
         for name, r in self._current.items():
             gpu = self._gpu_for(r, name)
             if gpu is not None:
@@ -1321,8 +1422,9 @@ class ProcessMonitorWindow(QMainWindow):
                     r["memoryUsageInBytes"],
                     gpu_pct,
                     vram,
-                    None if state is None else int(state),
+                    None if state is None else int(display_state(state)),
                 ),
+                replace_since,
             )
         self._usage.prune(now)
 
@@ -1349,16 +1451,22 @@ class ProcessMonitorWindow(QMainWindow):
             self._stale = stale
             self._apply_stale()  # grey out / restore the pages
         self._apply_report_state()
+        self._update_gpu_sampler()
         if self.stack.currentWidget() is self.detail:
             self.detail.tick(now, time.time())
         status = self._feed.status(now)
         if status is None:  # not connected: keep the error / reconnect text
             return
         text, level = status
+        if self._report_current():
+            source = f"the detailed report from {self.report_endpoint}"
+        else:
+            source = f"health records from {self.sub_endpoint} (no detailed report)"
         tips = {
-            "live": f"Receiving health reports from {self.sub_endpoint}",
-            "waiting": f"Connected to {self.sub_endpoint}; no health report yet",
-            "stale": f"No health reports from {self.sub_endpoint}"
+            "live": f"Receiving {source}",
+            "waiting": f"Connected to {self.sub_endpoint} and {self.report_endpoint}; "
+                       "nothing received yet",
+            "stale": f"Nothing received from {self.sub_endpoint} or {self.report_endpoint}"
                      + ("; the pages show the last values received (greyed out)"
                         if self._current else ""),
         }
@@ -1376,6 +1484,27 @@ class ProcessMonitorWindow(QMainWindow):
     def _on_log(self, msg: str):
         self._show_status(msg)
 
+    def _local_gpu_wanted(self, now: float) -> bool:
+        """Sample GPU use with this machine's nvidia-smi: only while the manager
+        measures none itself, and once its first report has had time to say so."""
+        if self._manager_gpu():
+            return False
+        waiting = self._report_at is None and now - self._gpu_wait_since < self._feed.stale_after()
+        return not waiting
+
+    def _update_gpu_sampler(self) -> None:
+        paused = not self._local_gpu_wanted(time.monotonic())
+        if paused != self._gpu_paused:
+            self._gpu_paused = paused
+            worker = getattr(self, "gpu_worker", None)
+            if worker is not None:
+                worker.set_paused(paused)
+            if paused:
+                self._gpu_by_pid = {}
+                self._gpu_available = False
+                self._gpu_error = None
+        self._refresh_gpu_status()
+
     def gpu_source(self) -> Tuple[str, str, str]:
         """(text, colour, tooltip) of the toolbar pill: where GPU figures come from."""
         if self._manager_gpu():
@@ -1383,8 +1512,14 @@ class ProcessMonitorWindow(QMainWindow):
                 "GPU · manager",
                 "#4caf50",
                 "GPU figures measured on the manager's host (NVML), summed over each "
-                "service's processes"
-                + ("; this machine's nvidia-smi is not used" if self._gpu_available else ""),
+                "service's processes; this machine's nvidia-smi is not run",
+            )
+        if self._gpu_paused:
+            return (
+                "GPU · waiting",
+                TEXT_MUTED,
+                "Waiting for the manager's detailed report to say whether it measures "
+                "GPU use; otherwise this machine's nvidia-smi is used",
             )
         if self._gpu_available:
             return (
@@ -1412,16 +1547,13 @@ class ProcessMonitorWindow(QMainWindow):
 
     @pyqtSlot(object, object, bool)
     def _on_gpu_sampled(self, result, err, available: bool):
+        if self._gpu_paused:
+            return  # a sample that was under way when the manager's figures came
         new_map: Dict[int, GpuProcessUsage] = result if result else {}
         failed = bool(err) and not new_map
-        if failed:
-            self._gpu_by_pid = {}
-            # Samples come every second; post an error once, not each time.
-            if err != self._last_gpu_error:
-                self._show_status(f"GPU sample error: {err}")
-        else:
-            self._gpu_by_pid = new_map
-        self._last_gpu_error = err if failed else None
+        # A failure shows in the GPU pill (red, the error in its tooltip), not
+        # in the status bar, which is for what the user did.
+        self._gpu_by_pid = {} if failed else new_map
         self._gpu_available = available and not failed
         self._gpu_error = err if isinstance(err, str) else None
         self._refresh_gpu_status()
@@ -1479,6 +1611,9 @@ class ProcessMonitorWindow(QMainWindow):
         self._link_up = False
         self.service_page.set_link_up(False)
         self._prev.clear()
+        self._health = {}
+        self._feed_snapshot = self._recorded_snapshot = None
+        self._gpu_wait_since = time.monotonic()  # the new manager's report decides again
         self._forget_report()
         self._set_link_status("Reconnecting…", "orange")
 

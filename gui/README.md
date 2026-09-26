@@ -54,7 +54,7 @@ Run these from this `gui/` directory.
 pip install -r requirements.txt
 
 # 2. Start the process manager (see ../manager/README.md) ...
-../manager/build/src/berayprocessmanager --config ../manager/config/services.conf
+../manager/build/bin/berayprocessmanager --config ../manager/config/services.conf
 
 #    ... or, to try the GUI without it, the mock process manager
 python mock_publisher.py

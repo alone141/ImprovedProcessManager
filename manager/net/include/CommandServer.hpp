@@ -122,11 +122,4 @@ private:
     ZmqSocket router;
 };
 
-/**
- * @brief Printable form of a client identity: text when printable, hexadecimal otherwise.
- * @param identity Routing identity frame.
- * @return For example "PMC" or "0x006b8b4567".
- */
-std::string DescribeIdentity(const Frame& identity);
-
 } // namespace process_manager

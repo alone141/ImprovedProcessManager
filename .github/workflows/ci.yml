@@ -68,11 +68,11 @@ jobs:
 
       - name: Command-line smoke test
         run: |
-          build/src/berayprocessmanager --version
-          build/src/berayprocessmanager --help > /dev/null
-          build/src/berayprocessmanager --check --config manager/config/services.conf
-          build/src/beraynetworkmanager --version
-          build/src/beraynetworkmanager --help > /dev/null
+          build/bin/berayprocessmanager --version
+          build/bin/berayprocessmanager --help > /dev/null
+          build/bin/berayprocessmanager --check --config manager/config/services.conf
+          build/bin/beraynetworkmanager --version
+          build/bin/beraynetworkmanager --help > /dev/null
 
   manager-gcc10:
     name: manager · GCC 10 (compiler floor)
@@ -119,9 +119,9 @@ jobs:
 
       - name: Command-line smoke test
         run: |
-          build/src/berayprocessmanager --version
-          build/src/berayprocessmanager --check --config manager/config/services.conf
-          build/src/beraynetworkmanager --version
+          build/bin/berayprocessmanager --version
+          build/bin/berayprocessmanager --check --config manager/config/services.conf
+          build/bin/beraynetworkmanager --version
 
   manager-vendored:
     name: manager · vendored libzmq and GoogleTest, CMake 4
@@ -164,9 +164,9 @@ jobs:
 
       - name: Command-line smoke test
         run: |
-          build/src/berayprocessmanager --version
-          build/src/berayprocessmanager --check --config manager/config/services.conf
-          build/src/beraynetworkmanager --version
+          build/bin/berayprocessmanager --version
+          build/bin/berayprocessmanager --check --config manager/config/services.conf
+          build/bin/beraynetworkmanager --version
 
   manager-windows:
     name: manager · Windows, MSVC, vendored libzmq and GoogleTest
@@ -204,11 +204,11 @@ jobs:
       # last one's exit code, so the first is checked by hand.
       - name: Command-line smoke test
         run: |
-          build\src\Release\berayprocessmanager.exe --version
+          buildin\Release\berayprocessmanager.exe --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          build\src\Release\berayprocessmanager.exe --check --config manager\config\services.conf
+          buildin\Release\berayprocessmanager.exe --check --config manager\config\services.conf
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          build\src\Release\beraynetworkmanager.exe --version
+          buildin\Release\beraynetworkmanager.exe --version
 
   gui-tests:
     name: gui · pytest, ${{ matrix.os }}

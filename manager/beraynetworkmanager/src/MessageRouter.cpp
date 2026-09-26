@@ -1,5 +1,4 @@
 #include "MessageRouter.hpp"
-#include "CommandServer.hpp"
 #include "Envelope.hpp"
 #include "Logger.hpp"
 #include "PeerAddress.hpp"

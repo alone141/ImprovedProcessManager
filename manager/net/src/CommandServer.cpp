@@ -3,8 +3,6 @@
 #include "ZmqSocket.hpp"
 
 #include <cstddef>
-#include <cstdint>
-#include <cstdio>
 #include <string>
 
 namespace process_manager
@@ -99,28 +97,6 @@ ZmqSocket& CommandServer::Socket()
 std::string CommandServer::Endpoint() const
 {
     return router.BoundEndpoint();
-}
-
-std::string DescribeIdentity(const Frame& identity)
-{
-    bool printable = !identity.empty();
-    for (const std::uint8_t byte : identity)
-    {
-        printable = printable && byte >= 0x20 && byte < 0x7f;
-    }
-    if (printable)
-    {
-        return std::string{identity.begin(), identity.end()};
-    }
-
-    std::string text{"0x"};
-    for (const std::uint8_t byte : identity)
-    {
-        char digits[3]{};
-        std::snprintf(digits, sizeof(digits), "%02x", byte);
-        text += digits;
-    }
-    return text;
 }
 
 } // namespace process_manager

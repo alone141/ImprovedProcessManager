@@ -151,3 +151,10 @@ TEST(ZmqSocketTest, EmptyMessagesAreRefused)
     process_manager::ZmqSocket dealer{context, process_manager::SocketType::Dealer};
     EXPECT_EQ(dealer.Send(process_manager::Message{}, true), process_manager::ZmqCode::Failed);
 }
+
+TEST(ZmqSocketTest, DescribesIdentities)
+{
+    EXPECT_EQ(process_manager::DescribeIdentity(process_manager::MakeFrame("PMC")), "PMC");
+    EXPECT_EQ(process_manager::DescribeIdentity(process_manager::Frame{0x00, 0x6b, 0x8b}), "0x006b8b");
+    EXPECT_EQ(process_manager::DescribeIdentity(process_manager::Frame{}), "0x");
+}

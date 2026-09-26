@@ -32,7 +32,7 @@ TEST(ConsoleTest, ArgumentsComeFromTheWideCommandLine)
     const std::vector<std::string> arguments = process_manager::Console::Arguments(std::span<char* const>{argv, 1});
     for (const std::string& argument : arguments)
     {
-        EXPECT_EQ(argument.find("process_manager_tests"), std::string::npos);
+        EXPECT_EQ(argument.find("process_manager_common_tests"), std::string::npos);
     }
 }
 

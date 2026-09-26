@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <span>
 #include <string>
@@ -84,6 +85,28 @@ bool FrameIs(const Frame& frame, std::string_view text)
         }
     }
     return true;
+}
+
+std::string DescribeIdentity(const Frame& identity)
+{
+    bool printable = !identity.empty();
+    for (const std::uint8_t byte : identity)
+    {
+        printable = printable && byte >= 0x20 && byte < 0x7f;
+    }
+    if (printable)
+    {
+        return std::string{identity.begin(), identity.end()};
+    }
+
+    std::string text{"0x"};
+    for (const std::uint8_t byte : identity)
+    {
+        char digits[3]{};
+        std::snprintf(digits, sizeof(digits), "%02x", byte);
+        text += digits;
+    }
+    return text;
 }
 
 std::string ZmqVersion()

@@ -80,6 +80,13 @@ Frame MakeFrame(std::string_view text);
 bool FrameIs(const Frame& frame, std::string_view text);
 
 /**
+ * @brief Printable form of an identity frame: text when printable, hexadecimal otherwise.
+ * @param identity Routing identity frame.
+ * @return For example "PMC" or "0x006b8b4567".
+ */
+std::string DescribeIdentity(const Frame& identity);
+
+/**
  * @brief The libzmq version linked in.
  * @return For example "4.3.2".
  */

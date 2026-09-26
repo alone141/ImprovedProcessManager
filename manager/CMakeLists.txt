@@ -30,8 +30,8 @@ endif()
 # Offline dependencies (versions in third_party/README.md). Each one is either
 # vendored under third_party/ and added here, before the targets that link it,
 # or already installed and found by the directory that uses it.
-#   libzmq      4.1 or newer, built with 4.3.2   (src/)
-#   GoogleTest  1.8.1 or newer, tests only        (tests/)
+#   libzmq      4.1 or newer, built with 4.3.2   (net/)
+#   GoogleTest  1.8.1 or newer, tests only        (below, for every tests/ directory)
 block()
     # Vendored code keeps its own warnings, also under -DCMAKE_COMPILE_WARNING_AS_ERROR=ON.
     set(CMAKE_COMPILE_WARNING_AS_ERROR OFF)
@@ -71,12 +71,39 @@ else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-add_subdirectory(src)
-
+# GoogleTest, for every tests/ directory below, in order: the vendored copy
+# (added above), an installed CMake package, CMake's FindGTest (set GTEST_ROOT
+# for a custom location).
 if(PROCESS_MANAGER_BUILD_TESTS)
+    if(NOT TARGET GTest::gtest_main AND NOT TARGET gtest_main)
+        find_package(GTest CONFIG QUIET)
+        if(NOT TARGET GTest::gtest_main)
+            find_package(GTest QUIET)
+        endif()
+    endif()
+    if(TARGET GTest::gtest_main)
+        set(PROCESS_MANAGER_GTEST_MAIN GTest::gtest_main)
+    elseif(TARGET gtest_main)
+        set(PROCESS_MANAGER_GTEST_MAIN gtest_main)
+    else()
+        message(FATAL_ERROR
+            "GoogleTest 1.8.1 or newer was not found. Install it offline "
+            "(Debian/Ubuntu: libgtest-dev, RHEL/Fedora: gtest-devel), unpack its source "
+            "into third_party/googletest, pass -DGTEST_ROOT=..., or configure with "
+            "-DPROCESS_MANAGER_BUILD_TESTS=OFF")
+    endif()
     enable_testing()
-    add_subdirectory(tests)
 endif()
+
+# The four libraries, lowest first, then the two programs, each in a directory
+# named after its binary. Every directory has the same shape: include/ is its
+# API, src/ its implementation and tests/ its GoogleTest suite.
+add_subdirectory(common)
+add_subdirectory(model)
+add_subdirectory(net)
+add_subdirectory(service)
+add_subdirectory(beraynetworkmanager)
+add_subdirectory(berayprocessmanager)
 
 # Files that are not build targets: the example configuration and the systemd unit.
 install(FILES config/services.conf DESTINATION share/berayprocessmanager)

@@ -33,7 +33,8 @@ cmake --build build -j
 ctest --test-dir build
 ```
 
-The build puts `berayprocessmanager` and `beraynetworkmanager` in `build/src`.
+The build puts `berayprocessmanager` and `beraynetworkmanager` in `build/bin`
+(`build/bin/Release` with Visual Studio).
 `-DCMAKE_COMPILE_WARNING_AS_ERROR=ON` turns compiler warnings into errors in the
 project's own code. Without GoogleTest, configure with
 `-DPROCESS_MANAGER_BUILD_TESTS=OFF`. For a
@@ -266,22 +267,21 @@ There is no reload signal; use `--reload`.
 
 ## Layout
 
-| Module | Role |
-|--------|------|
-| `Daemon` | the run mode: sockets, the poll loop, reload, shutdown |
-| `ServiceManager`, `Service` | the services and their state machine |
-| `ConfigParser`, `ServiceConfig` | the configuration file |
-| `ProcessLauncher`, `NativeLauncher` | starting, stopping and measuring processes (`src/posix`, `src/windows`) |
-| `CgroupTree`, `ProcFs`, `ProcessTable`, `SystemMonitor`, `GpuMonitor` | measurements |
-| `HealthRecord`, `DetailedReport`, `CommandMessage`, `WireReader`, `WireWriter` | the wire format |
-| `ZmqSocket`, `ReportPublisher`, `CommandServer`, `ManagerClient` | ZeroMQ |
-| `MessageRouter`, `Envelope`, `RouterLink`, `RouterOptions`, `PeerAddress` | the router, its framing, the manager's link to it, its command line, and the peer address in its connection log (`src/posix`, `src/windows`) |
-| `CommandLine`, `StatusTable`, `Console` | the command line |
-| `Logger`, `Instant`, `SignalWatcher`, `SystemdNotifier` | support |
+Four libraries and two programs, each in a directory of the same shape:
+`include/` is its API, `src/` its implementation (`posix/` and `windows/` hold
+the platform halves), `tests/` one GoogleTest file per module. A directory
+links only the ones listed before it. The two programs are named after their
+binaries and are independent of each other; the manager's tests link the
+router library to run a router in-process.
 
-`process_manager_core` holds everything but ZeroMQ; `process_manager_net` adds
-the sockets, the router and the daemon; `tests/` has one GoogleTest file per
-module. `main.cpp` is the manager and `RouterMain.cpp` the router.
+| Directory | Library | Modules |
+|-----------|---------|---------|
+| `common/` | `process_manager_common` | `Instant`, `Logger`, `WireReader`, `WireWriter`, `ProcFs`, `Console`, `SignalWatcher`, `SystemdNotifier`, `Version`: time, logging, the wire codec, `/proc`, the program environment |
+| `model/` | `process_manager_model` | `ServiceConfig`, `ServiceState`, `HealthRecord`, `CommandMessage`, `DetailedReport`: the configuration and the messages of the protocol document |
+| `net/` | `process_manager_net` | `ZmqSocket`, `CommandServer`, `ReportPublisher`: ZeroMQ, the only directory that links libzmq |
+| `service/` | `process_manager_service` | `ConfigParser`, `Service`, `ServiceManager`, `ProcessLauncher`, `NativeLauncher`, `ProcessTable`, `CgroupTree`, `SystemMonitor`, `GpuMonitor`, `ReportBuilder`: supervision and measurement |
+| `beraynetworkmanager/` | `process_manager_router` | `MessageRouter`, `Envelope`, `RouterOptions`, `PeerAddress` and `main.cpp`: the router |
+| `berayprocessmanager/` | `process_manager_daemon` | `Daemon`, `RouterLink`, `ManagerClient`, `CommandLine`, `StatusTable` and `main.cpp`: the manager, its link to the router, and the command-line client |
 
 ## Style notes
 
@@ -291,5 +291,5 @@ than the guide's sample. The departures:
 
 - Win32 sources include `<windows.h>` before the other system headers, which
   depend on it.
-- Platform code sits in `src/posix` and `src/windows`, one file per module and
-  platform; the few `#ifdef` blocks elsewhere say why.
+- Platform code sits in a directory's `src/posix` and `src/windows`, one file
+  per module and platform; the few `#ifdef` blocks elsewhere say why.

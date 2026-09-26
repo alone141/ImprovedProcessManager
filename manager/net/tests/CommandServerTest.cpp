@@ -130,10 +130,3 @@ TEST(CommandServerTest, NothingQueuedMeansEmpty)
     std::string problem{};
     EXPECT_EQ(fixture.server.Receive(request, problem), process_manager::RequestCode::Empty);
 }
-
-TEST(CommandServerTest, DescribesIdentities)
-{
-    EXPECT_EQ(process_manager::DescribeIdentity(process_manager::MakeFrame("PMC")), "PMC");
-    EXPECT_EQ(process_manager::DescribeIdentity(process_manager::Frame{0x00, 0x6b, 0x8b}), "0x006b8b");
-    EXPECT_EQ(process_manager::DescribeIdentity(process_manager::Frame{}), "0x");
-}

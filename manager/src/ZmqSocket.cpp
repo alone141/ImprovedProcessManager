@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <span>
 #include <string>
 #include <string_view>
@@ -31,6 +32,8 @@ int TypeValue(SocketType type)
         return ZMQ_ROUTER;
     case SocketType::Dealer:
         return ZMQ_DEALER;
+    case SocketType::Pair:
+        return ZMQ_PAIR;
     }
     return ZMQ_DEALER;
 }
@@ -47,6 +50,8 @@ int OptionValue(SocketOption option)
         return ZMQ_RCVHWM;
     case SocketOption::RouterHandover:
         return ZMQ_ROUTER_HANDOVER;
+    case SocketOption::RouterMandatory:
+        return ZMQ_ROUTER_MANDATORY;
     case SocketOption::Ipv6:
         return ZMQ_IPV6;
     case SocketOption::Subscribe:
@@ -90,6 +95,33 @@ std::string ZmqVersion()
     return std::to_string(major) + "." + std::to_string(minor) + "." + std::to_string(patch);
 }
 
+bool DecodeSocketEvent(const Message& message, SocketEvent& out)
+{
+    // libzmq: a 16-bit event number and a 32-bit value (the descriptor), then the endpoint.
+    constexpr std::size_t event_size = sizeof(std::uint16_t) + sizeof(std::uint32_t);
+    if (message.size() != 2 || message[0].size() < event_size)
+    {
+        return false;
+    }
+
+    std::uint16_t number = 0;
+    std::uint32_t value = 0;
+    std::memcpy(&number, message[0].data(), sizeof(number));
+    std::memcpy(&value, message[0].data() + sizeof(number), sizeof(value));
+    out = SocketEvent{};
+    out.descriptor = value;
+    out.endpoint = std::string{message[1].begin(), message[1].end()};
+    if (number == ZMQ_EVENT_ACCEPTED)
+    {
+        out.kind = SocketEventKind::Accepted;
+    }
+    else if (number == ZMQ_EVENT_DISCONNECTED)
+    {
+        out.kind = SocketEventKind::Disconnected;
+    }
+    return true;
+}
+
 ZmqContext::ZmqContext()
     : handle{zmq_ctx_new()}
 {
@@ -129,7 +161,7 @@ void* ZmqContext::Handle() const
 
 ZmqSocket::ZmqSocket(ZmqContext& context, SocketType type)
     : handle{context.Handle() != nullptr ? zmq_socket(context.Handle(), TypeValue(type)) : nullptr},
-      lastError{handle != nullptr ? 0 : zmq_errno()}
+      lastError{handle != nullptr ? 0 : zmq_errno()}, monitored{false}
 {
     if (handle != nullptr)
     {
@@ -143,9 +175,10 @@ ZmqSocket::~ZmqSocket()
 }
 
 ZmqSocket::ZmqSocket(ZmqSocket&& other) noexcept
-    : handle{other.handle}, lastError{other.lastError}
+    : handle{other.handle}, lastError{other.lastError}, monitored{other.monitored}
 {
     other.handle = nullptr;
+    other.monitored = false;
 }
 
 ZmqSocket& ZmqSocket::operator=(ZmqSocket&& other) noexcept
@@ -155,7 +188,9 @@ ZmqSocket& ZmqSocket::operator=(ZmqSocket&& other) noexcept
         Close();
         handle = other.handle;
         lastError = other.lastError;
+        monitored = other.monitored;
         other.handle = nullptr;
+        other.monitored = false;
     }
     return *this;
 }
@@ -222,9 +257,25 @@ ZmqCode ZmqSocket::Send(std::span<const Frame> message, bool dontWait)
         if (zmq_send(handle, data, frame.size(), flags) < 0)
         {
             lastError = zmq_errno();
+            if (lastError == EHOSTUNREACH)
+            {
+                return ZmqCode::Unreachable;
+            }
             return lastError == EAGAIN && i == 0 ? ZmqCode::WouldBlock : ZmqCode::Failed;
         }
     }
+    return ZmqCode::Ok;
+}
+
+ZmqCode ZmqSocket::MonitorConnections(const std::string& endpoint)
+{
+    if (handle == nullptr ||
+        zmq_socket_monitor(handle, endpoint.c_str(), ZMQ_EVENT_ACCEPTED | ZMQ_EVENT_DISCONNECTED) != 0)
+    {
+        lastError = handle == nullptr ? ENOTSOCK : zmq_errno();
+        return ZmqCode::Failed;
+    }
+    monitored = true;
     return ZmqCode::Ok;
 }
 
@@ -290,6 +341,11 @@ void ZmqSocket::Close()
 {
     if (handle != nullptr)
     {
+        if (monitored)
+        {
+            zmq_socket_monitor(handle, nullptr, 0);
+            monitored = false;
+        }
         zmq_close(handle);
         handle = nullptr;
     }

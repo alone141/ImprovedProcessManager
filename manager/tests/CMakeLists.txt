@@ -32,17 +32,21 @@ add_executable(process_manager_tests
     ConsoleTest.cpp
     DaemonTest.cpp
     DetailedReportTest.cpp
+    EnvelopeTest.cpp
     GpuMonitorTest.cpp
     HealthRecordTest.cpp
     InstantTest.cpp
     LoggerTest.cpp
     ManagerClientTest.cpp
+    MessageRouterTest.cpp
     NativeLauncherTest.cpp
     ProcFsTest.cpp
     ProcessLauncherTest.cpp
     ProcessTableTest.cpp
     ReportBuilderTest.cpp
     ReportPublisherTest.cpp
+    RouterLinkTest.cpp
+    RouterOptionsTest.cpp
     ServiceConfigTest.cpp
     ServiceManagerTest.cpp
     ServiceStateTest.cpp

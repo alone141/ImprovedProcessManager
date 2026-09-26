@@ -95,11 +95,16 @@ struct ServiceConfig
     std::uint32_t cpuMaxPercent{0};
 };
 
+// The manager's name on a router when the configuration gives none.
+constexpr std::string_view default_manager_identity = "berayprocessmanager";
+
 struct ManagerSettings
 {
     std::string healthEndpoint{"tcp://*:6667"};
     std::string reportEndpoint{"tcp://*:6668"};
     std::string commandEndpoint{"tcp://*:5557"};
+    std::string routerEndpoint;                     // empty: commands arrive on the ROUTER only
+    std::string identity{default_manager_identity}; // the manager's name on the router
     std::chrono::milliseconds publishInterval{1000};
     LogLevel logLevel{LogLevel::Info};
     CgroupMode cgroups{CgroupMode::Auto};
@@ -136,6 +141,14 @@ const ServiceConfig* FindService(const Config& config, std::string_view name);
  * @return true when the name is valid.
  */
 bool IsValidServiceName(std::string_view name);
+
+/**
+ * @brief Tell whether text can be an identity on a router: 1 to 255 printable ASCII
+ *        characters without spaces, so it fits a libzmq identity and reads well in logs.
+ * @param identity Candidate identity.
+ * @return true when the identity is valid.
+ */
+bool IsValidIdentity(std::string_view identity);
 
 /**
  * @brief Name of a restart mode as the configuration spells it.

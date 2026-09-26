@@ -63,3 +63,17 @@ TEST(ServiceConfigTest, FindsServicesByName)
     EXPECT_EQ(found->name, "two");
     EXPECT_EQ(process_manager::FindService(config, "three"), nullptr);
 }
+
+TEST(ServiceConfigTest, ValidatesRouterIdentities)
+{
+    EXPECT_TRUE(process_manager::IsValidIdentity("berayprocessmanager"));
+    EXPECT_TRUE(process_manager::IsValidIdentity("bpm-rig01"));
+    EXPECT_TRUE(process_manager::IsValidIdentity("PMC"));
+    EXPECT_TRUE(process_manager::IsValidIdentity(std::string(255, 'x')));
+    EXPECT_FALSE(process_manager::IsValidIdentity(""));
+    EXPECT_FALSE(process_manager::IsValidIdentity("has space"));
+    EXPECT_FALSE(process_manager::IsValidIdentity("tab\there"));
+    EXPECT_FALSE(process_manager::IsValidIdentity(std::string(256, 'x')));
+    EXPECT_FALSE(process_manager::IsValidIdentity(std::string("\x01", 1)));
+    EXPECT_FALSE(process_manager::IsValidIdentity("\xc3\xa4")); // not ASCII
+}

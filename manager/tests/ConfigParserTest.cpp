@@ -33,6 +33,8 @@ const char* const full_example = R"(# Example
 health_endpoint = tcp://*:7001
 report_endpoint = tcp://*:7002   # inline comment
 command_endpoint = tcp://127.0.0.1:7003
+router_endpoint = tcp://127.0.0.1:7004
+identity = bpm-rig01
 publish_interval_ms = 500
 log_level = debug
 cgroups = off
@@ -88,6 +90,8 @@ TEST(ConfigParserTest, ParsesEveryKey)
     EXPECT_EQ(config.manager.healthEndpoint, "tcp://*:7001");
     EXPECT_EQ(config.manager.reportEndpoint, "tcp://*:7002");
     EXPECT_EQ(config.manager.commandEndpoint, "tcp://127.0.0.1:7003");
+    EXPECT_EQ(config.manager.routerEndpoint, "tcp://127.0.0.1:7004");
+    EXPECT_EQ(config.manager.identity, "bpm-rig01");
     EXPECT_EQ(config.manager.publishInterval, std::chrono::milliseconds{500});
     EXPECT_EQ(config.manager.logLevel, process_manager::LogLevel::Debug);
     EXPECT_EQ(config.manager.cgroups, process_manager::CgroupMode::Off);
@@ -213,6 +217,22 @@ TEST(ConfigParserTest, RejectsInvalidValues)
     EXPECT_EQ(Parse("[manager]\npublish_interval_ms = 10\n", config, error), process_manager::ConfigCode::InvalidValue);
     EXPECT_EQ(Parse("[service a]\nbinary = x\nrestart_delay_ms = 5000\nrestart_delay_max_ms = 1000\n", config, error),
               process_manager::ConfigCode::InvalidValue);
+    EXPECT_EQ(Parse("[manager]\nidentity = has space\n", config, error), process_manager::ConfigCode::InvalidValue);
+    EXPECT_EQ(error.line, 2);
+}
+
+TEST(ConfigParserTest, RouterIsOffWithoutAnEndpoint)
+{
+    process_manager::Config config{};
+    process_manager::ConfigError error{};
+    ASSERT_EQ(Parse("[service a]\nbinary = x\n", config, error), process_manager::ConfigCode::Ok);
+    EXPECT_TRUE(config.manager.routerEndpoint.empty());
+    EXPECT_EQ(config.manager.identity, process_manager::default_manager_identity);
+    EXPECT_EQ(Parse("[manager]\nrouter_endpoint = \n", config, error), process_manager::ConfigCode::MissingValue);
+    ASSERT_EQ(Parse("[manager]\nrouter_endpoint = tcp://router:5558\n", config, error), process_manager::ConfigCode::Ok)
+        << error.message;
+    EXPECT_EQ(config.manager.routerEndpoint, "tcp://router:5558");
+    EXPECT_EQ(config.manager.identity, "berayprocessmanager");
 }
 
 TEST(ConfigParserTest, RejectsUnknownDependencies)

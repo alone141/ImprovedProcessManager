@@ -33,6 +33,8 @@ struct Options
     bool configGiven{false};
     std::string commandEndpoint; // empty: taken from the configuration, or the default
     std::string reportEndpoint;  // empty: taken from the configuration, or the default
+    std::string routerEndpoint;  // empty: commands go to the command endpoint, not through a router
+    std::string managerIdentity; // with a router; empty: taken from the configuration, or the default
     std::chrono::milliseconds timeout{3000};
     bool timeoutGiven{false};
     bool watch{false};

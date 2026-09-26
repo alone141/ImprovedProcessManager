@@ -348,6 +348,27 @@ ConfigCode ApplyManagerKey(ManagerSettings& manager, std::string_view key, std::
         }
         return ConfigCode::Ok;
     }
+    if (key == "router_endpoint")
+    {
+        const std::string endpoint = Unquote(value);
+        if (endpoint.empty())
+        {
+            return Fail(error, ConfigCode::MissingValue, line, "router_endpoint needs an endpoint");
+        }
+        manager.routerEndpoint = endpoint;
+        return ConfigCode::Ok;
+    }
+    if (key == "identity")
+    {
+        const std::string identity = Unquote(value);
+        if (!IsValidIdentity(identity))
+        {
+            return Fail(error, ConfigCode::InvalidValue, line,
+                        "identity must be 1 to 255 printable characters without spaces");
+        }
+        manager.identity = identity;
+        return ConfigCode::Ok;
+    }
     return Fail(error, ConfigCode::UnknownKey, line, "unknown key '" + std::string{key} + "' in [manager]");
 }
 

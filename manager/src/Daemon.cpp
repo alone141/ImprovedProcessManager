@@ -22,7 +22,6 @@
 #include "ZmqSocket.hpp"
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -86,7 +85,7 @@ std::string DescribeReply(const CommandReply& reply)
 
 Daemon::Daemon(Config config)
     : config{std::move(config)}, startedAt{Now()}, cgroups{}, launcher{}, manager{}, gpu{}, system{},
-      builder{CurrentPid(), startedAt.wallNs}, context{}, publisher{}, server{}, stopRequested{false},
+      builder{CurrentPid(), startedAt.wallNs}, context{}, publisher{}, server{}, link{}, stopRequested{false},
       reloadRequested{false}, logLevelOverride{}, stopping{false}, shutdownDeadline{}, nextPublish{}
 {
 }
@@ -135,6 +134,17 @@ DaemonCode Daemon::Start(std::string& error)
 
     std::vector<EnvironmentVariable> environment{
         EnvironmentVariable{"BPM_COMMAND_ENDPOINT", ConnectEndpoint(server->Endpoint())}};
+    if (!config.manager.routerEndpoint.empty())
+    {
+        link = std::make_unique<RouterLink>(context);
+        if (link->Connect(config.manager.routerEndpoint, config.manager.identity, error) != ZmqCode::Ok)
+        {
+            return DaemonCode::RouterFailed;
+        }
+        LogInfo("commands also through the router at " + link->Endpoint() + " as " + link->Identity());
+        environment.push_back(EnvironmentVariable{"BPM_ROUTER_ENDPOINT", link->Endpoint()});
+        environment.push_back(EnvironmentVariable{"BPM_MANAGER_IDENTITY", link->Identity()});
+    }
     manager = std::make_unique<ServiceManager>(*launcher, std::move(environment));
     manager->Load(config.services);
     LogInfo(std::to_string(config.services.size()) + " services configured" +
@@ -183,14 +193,22 @@ int Daemon::Run()
             std::chrono::duration_cast<std::chrono::milliseconds>(nextPublish - now.steady);
         const std::chrono::milliseconds wait =
             std::clamp(untilPublish, std::chrono::milliseconds{0}, max_poll_wait);
-        const std::array<ZmqSocket*, 1> sockets{&server->Socket()};
+        std::vector<ZmqSocket*> sockets{&server->Socket()};
+        if (link != nullptr)
+        {
+            sockets.push_back(&link->Socket());
+        }
         std::vector<bool> ready{};
         PollReadable(sockets, wait, ready);
 
         now = Now();
         if (!ready.empty() && ready[0])
         {
-            HandleCommands(now);
+            HandleCommands(*server, now);
+        }
+        if (link != nullptr && ready.size() > 1 && ready[1])
+        {
+            HandleCommands(*link, now);
         }
         manager->Tick(now);
         RemoveTaskGroups(manager->TakeRemoved());
@@ -321,13 +339,13 @@ void Daemon::RemoveTaskGroups(std::span<const std::string> names)
     }
 }
 
-void Daemon::HandleCommands(const Instant& now)
+void Daemon::HandleCommands(CommandSource& source, const Instant& now)
 {
     for (int round = 0; round < max_commands_per_round; ++round)
     {
         CommandRequest request{};
         std::string problem{};
-        const RequestCode code = server->Receive(request, problem);
+        const RequestCode code = source.Receive(request, problem);
         if (code == RequestCode::Empty)
         {
             return;
@@ -339,7 +357,7 @@ void Daemon::HandleCommands(const Instant& now)
             LogWarning("malformed command from " + DescribeIdentity(request.identity) + ": " + problem);
             reply.result = CommandResult::Malformed;
             reply.message = problem;
-            server->Reply(request, reply);
+            source.Reply(request, reply);
             continue;
         }
 
@@ -367,7 +385,7 @@ void Daemon::HandleCommands(const Instant& now)
         {
             LogInfo(summary);
         }
-        server->Reply(request, reply);
+        source.Reply(request, reply);
     }
 }
 
@@ -404,10 +422,11 @@ CommandReply Daemon::Reload(const Instant& now)
     SystemdNotifier::Notify("RELOADING=1");
     const ManagerSettings& next = fresh.manager;
     if (next.healthEndpoint != config.manager.healthEndpoint || next.reportEndpoint != config.manager.reportEndpoint ||
-        next.commandEndpoint != config.manager.commandEndpoint || next.cgroups != config.manager.cgroups ||
+        next.commandEndpoint != config.manager.commandEndpoint || next.routerEndpoint != config.manager.routerEndpoint ||
+        next.identity != config.manager.identity || next.cgroups != config.manager.cgroups ||
         next.gpu != config.manager.gpu)
     {
-        LogWarning("endpoint, cgroups and gpu changes take effect when the manager restarts");
+        LogWarning("endpoint, router, identity, cgroups and gpu changes take effect when the manager restarts");
     }
     config.manager.publishInterval = next.publishInterval;
     config.manager.logLevel = next.logLevel;

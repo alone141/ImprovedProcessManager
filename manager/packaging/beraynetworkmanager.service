@@ -1,0 +1,24 @@
+# systemd unit for the router. Managers and clients connect to it by identity;
+# the process manager's own unit does not depend on it, since its link to the
+# router reconnects on its own.
+#
+#   sudo cp beraynetworkmanager.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now beraynetworkmanager
+
+[Unit]
+Description=Beray network manager (ZeroMQ message router)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/beraynetworkmanager --bind tcp://*:5558
+Restart=on-failure
+RestartSec=2
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

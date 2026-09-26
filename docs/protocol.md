@@ -15,6 +15,8 @@ nanoseconds since the Unix epoch.
 
 The health socket and the command socket are unchanged from the protocol the
 GUI was built for; everything else is an addition that older clients ignore.
+Commands can also travel through a router, `beraynetworkmanager`; the last
+section describes that.
 
 ## Health report (port 6667)
 
@@ -183,3 +185,42 @@ starts every service with these variables:
 | `BPM_HEARTBEAT_INTERVAL_MS` | the interval, when heartbeats are supervised |
 
 A shell script can beat with `berayprocessmanager --heartbeat NAME --command "$BPM_COMMAND_ENDPOINT"`.
+
+## Commands through a router
+
+`beraynetworkmanager` is a ZeroMQ identity router (the NetworkManager design):
+one ROUTER socket, `tcp://*:5558` unless `--bind` says otherwise, to which every
+peer connects a DEALER under a unique identity. A peer sends
+`[destination][payload…]`; the router delivers `[source][payload…]` to the
+destination. It drops, with a warning in its log, what it cannot deliver: a
+message to an identity that is not connected, or one without a destination.
+Nothing is queued for a peer that is away, and the payload is never parsed.
+
+With `router_endpoint` set, the manager connects a DEALER to the router under
+its `identity` (`berayprocessmanager` unless configured) and serves commands
+from there as well as from its own command socket. The frames are the same
+65-byte command and 128-byte reply as on port 5557, addressed by identity:
+
+| Direction | Frames on the client's DEALER |
+|-----------|-------------------------------|
+| Command | `[manager identity]` `BPM` command |
+| Reply | `[manager identity]` `BPM` reply |
+
+The manager receives the command as `[client identity]` `BPM` command and
+answers to that identity. A client's identity is whatever it set, or the one
+libzmq picked; two clients must not share one, since the router hands a name
+over to its newest connection. The GUI keeps using the direct socket.
+
+`berayprocessmanager --stop NAME --router tcp://HOST:5558 [--manager IDENTITY]`
+sends this way. `--status` still reads the report socket directly: only
+commands travel through the router. A command to an identity that is not
+connected gets no reply, so the client reports no answer after its `--timeout`.
+
+With a router configured the manager starts every service with two more
+variables, so a heartbeat can travel the same way
+(`berayprocessmanager --heartbeat NAME --router "$BPM_ROUTER_ENDPOINT" --manager "$BPM_MANAGER_IDENTITY"`):
+
+| Variable | Value |
+|----------|-------|
+| `BPM_ROUTER_ENDPOINT` | the router, for example `tcp://127.0.0.1:5558` |
+| `BPM_MANAGER_IDENTITY` | the manager's identity on it |

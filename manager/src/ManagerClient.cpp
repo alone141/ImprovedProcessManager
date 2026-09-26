@@ -39,27 +39,43 @@ std::chrono::milliseconds Remaining(std::chrono::steady_clock::time_point deadli
 } // namespace
 
 ManagerClient::ManagerClient(std::string commandEndpoint, std::string reportEndpoint)
-    : context{}, commandEndpoint{std::move(commandEndpoint)}, reportEndpoint{std::move(reportEndpoint)}, subscriber{}
+    : context{}, commandEndpoint{std::move(commandEndpoint)}, reportEndpoint{std::move(reportEndpoint)},
+      routerEndpoint{}, managerIdentity{}, subscriber{}
 {
+}
+
+void ManagerClient::UseRouter(std::string endpoint, std::string identity)
+{
+    routerEndpoint = std::move(endpoint);
+    managerIdentity = std::move(identity);
 }
 
 ClientCode ManagerClient::SendCommand(CommandCode command, const std::string& service,
                                       std::chrono::milliseconds timeout, CommandReply& out, std::string& error)
 {
+    const bool viaRouter = !routerEndpoint.empty();
+    const std::string& target = viaRouter ? routerEndpoint : commandEndpoint;
     ZmqSocket dealer{context, SocketType::Dealer};
-    AllowIpv6(dealer, commandEndpoint);
-    if (dealer.Connect(commandEndpoint) != ZmqCode::Ok)
+    AllowIpv6(dealer, target);
+    if (dealer.Connect(target) != ZmqCode::Ok)
     {
-        error = "cannot connect to " + commandEndpoint + ": " + dealer.LastError();
+        error = "cannot connect to " + target + ": " + dealer.LastError();
         return ClientCode::Failed;
     }
 
     CommandMessage message{};
     message.command = static_cast<std::uint8_t>(command);
     message.serviceName = service;
-    if (dealer.Send(Message{MakeFrame(command_tag), EncodeCommand(message)}, true) != ZmqCode::Ok)
+    Message request{};
+    if (viaRouter)
     {
-        error = "cannot send to " + commandEndpoint + ": " + dealer.LastError();
+        request.push_back(MakeFrame(managerIdentity));
+    }
+    request.push_back(MakeFrame(command_tag));
+    request.push_back(EncodeCommand(message));
+    if (dealer.Send(request, true) != ZmqCode::Ok)
+    {
+        error = "cannot send to " + target + ": " + dealer.LastError();
         return ClientCode::Failed;
     }
 
@@ -69,8 +85,11 @@ ClientCode ManagerClient::SendCommand(CommandCode command, const std::string& se
         const std::chrono::milliseconds left = Remaining(deadline);
         if (left.count() <= 0)
         {
-            error = "no reply from the manager at " + commandEndpoint + " within " + std::to_string(timeout.count()) +
-                    " ms; is it running?";
+            error = viaRouter ? "no reply from " + managerIdentity + " through the router at " + routerEndpoint +
+                                    " within " + std::to_string(timeout.count()) +
+                                    " ms; is the manager connected to the router under that identity?"
+                              : "no reply from the manager at " + commandEndpoint + " within " +
+                                    std::to_string(timeout.count()) + " ms; is it running?";
             return ClientCode::Timeout;
         }
 
@@ -95,6 +114,19 @@ ClientCode ManagerClient::SendCommand(CommandCode command, const std::string& se
         while (index < reply.size() && reply[index].empty())
         {
             ++index;
+        }
+        // Through a router the reply names its sender first; anyone else's message is not the answer.
+        if (viaRouter)
+        {
+            if (index >= reply.size() || !FrameIs(reply[index], managerIdentity))
+            {
+                continue;
+            }
+            ++index;
+            while (index < reply.size() && reply[index].empty())
+            {
+                ++index;
+            }
         }
         if (index + 2 != reply.size() || !FrameIs(reply[index], command_tag) ||
             DecodeReply(reply[index + 1], out) != DecodeCode::Ok)

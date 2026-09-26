@@ -71,6 +71,8 @@ jobs:
           build/src/berayprocessmanager --version
           build/src/berayprocessmanager --help > /dev/null
           build/src/berayprocessmanager --check --config manager/config/services.conf
+          build/src/beraynetworkmanager --version
+          build/src/beraynetworkmanager --help > /dev/null
 
   manager-gcc10:
     name: manager · GCC 10 (compiler floor)
@@ -119,6 +121,7 @@ jobs:
         run: |
           build/src/berayprocessmanager --version
           build/src/berayprocessmanager --check --config manager/config/services.conf
+          build/src/beraynetworkmanager --version
 
   manager-vendored:
     name: manager · vendored libzmq and GoogleTest, CMake 4
@@ -163,6 +166,7 @@ jobs:
         run: |
           build/src/berayprocessmanager --version
           build/src/berayprocessmanager --check --config manager/config/services.conf
+          build/src/beraynetworkmanager --version
 
   manager-windows:
     name: manager · Windows, MSVC, vendored libzmq and GoogleTest
@@ -203,6 +207,8 @@ jobs:
           build\src\Release\berayprocessmanager.exe --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           build\src\Release\berayprocessmanager.exe --check --config manager\config\services.conf
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          build\src\Release\beraynetworkmanager.exe --version
 
   gui-tests:
     name: gui · pytest, ${{ matrix.os }}

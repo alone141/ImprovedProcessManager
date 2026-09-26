@@ -17,6 +17,7 @@ enum class ZmqCode
 {
     Ok,
     WouldBlock,
+    Unreachable, // a Router with RouterMandatory set has no peer by the identity in the first frame
     Failed,
 };
 
@@ -26,6 +27,7 @@ enum class SocketType
     Subscriber,
     Router,
     Dealer,
+    Pair,
 };
 
 enum class SocketOption
@@ -34,10 +36,33 @@ enum class SocketOption
     SendHighWater,
     ReceiveHighWater,
     RouterHandover,
+    RouterMandatory,
     Ipv6,
     Subscribe,
     Identity,
 };
+
+enum class SocketEventKind
+{
+    Accepted,
+    Disconnected,
+    Other,
+};
+
+struct SocketEvent
+{
+    SocketEventKind kind{SocketEventKind::Other};
+    std::uint32_t descriptor{0}; // the connection's socket descriptor
+    std::string endpoint;        // the bound endpoint the connection belongs to
+};
+
+/**
+ * @brief Decode one event read from a monitor socket (see ZmqSocket::MonitorConnections).
+ * @param message Two frames: the event number with the descriptor, then the endpoint.
+ * @param out Receives the event.
+ * @return true when the message is a monitor event.
+ */
+bool DecodeSocketEvent(const Message& message, SocketEvent& out);
 
 /**
  * @brief Make a frame holding text.
@@ -170,9 +195,18 @@ public:
      * @brief Send a multipart message.
      * @param message Frames to send; it must not be empty.
      * @param dontWait Return ZmqCode::WouldBlock instead of waiting when the queue is full.
-     * @return ZmqCode::Ok, ZmqCode::WouldBlock, or ZmqCode::Failed.
+     * @return ZmqCode::Ok, ZmqCode::WouldBlock, ZmqCode::Unreachable from a Router with
+     *         RouterMandatory set when no peer has the identity in the first frame, or ZmqCode::Failed.
      */
     ZmqCode Send(std::span<const Frame> message, bool dontWait);
+
+    /**
+     * @brief Report the connections this socket accepts and loses on an inproc endpoint, which
+     *        a Pair socket of the same context reads with DecodeSocketEvent. Call it before Bind.
+     * @param endpoint For example inproc://router-monitor; it must be unique within the context.
+     * @return ZmqCode::Ok, or ZmqCode::Failed.
+     */
+    ZmqCode MonitorConnections(const std::string& endpoint);
 
     /**
      * @brief Receive a multipart message.
@@ -205,6 +239,7 @@ private:
 
     void* handle;
     int lastError;
+    bool monitored;
 };
 
 /**

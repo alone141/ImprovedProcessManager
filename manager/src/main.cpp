@@ -47,14 +47,16 @@ std::string DescribeConfigError(const std::string& path, const ConfigError& erro
     return path + (error.line > 0 ? ":" + std::to_string(error.line) : std::string{}) + ": " + error.message;
 }
 
-// Client modes read the endpoints from the configuration when it exists, so a
-// manager on custom ports is found without repeating them on the command line.
+// Client modes read the endpoints and the manager's identity from the
+// configuration when it exists, so a manager on custom ports or under a custom
+// name on the router is found without repeating them on the command line.
 int ResolveEndpoints(const Options& options, std::string& command, std::string& report,
-                     std::chrono::milliseconds& interval)
+                     std::chrono::milliseconds& interval, std::string& identity)
 {
     command = "tcp://127.0.0.1:5557";
     report = "tcp://127.0.0.1:6668";
     interval = std::chrono::milliseconds{1000};
+    identity = std::string{default_manager_identity};
     std::error_code status{};
     if (options.configGiven || std::filesystem::exists(Utf8Path(options.configPath), status))
     {
@@ -66,6 +68,7 @@ int ResolveEndpoints(const Options& options, std::string& command, std::string& 
             command = ConnectEndpoint(config.manager.commandEndpoint);
             report = ConnectEndpoint(config.manager.reportEndpoint);
             interval = config.manager.publishInterval;
+            identity = config.manager.identity;
         }
         else if (options.configGiven)
         {
@@ -142,7 +145,8 @@ int RunStatus(const Options& options)
     std::string command{};
     std::string report{};
     std::chrono::milliseconds interval{};
-    const int resolved = ResolveEndpoints(options, command, report, interval);
+    std::string identity{};
+    const int resolved = ResolveEndpoints(options, command, report, interval, identity);
     if (resolved != exit_ok)
     {
         return resolved;
@@ -192,7 +196,8 @@ int RunCommand(const Options& options)
     std::string command{};
     std::string report{};
     std::chrono::milliseconds interval{};
-    const int resolved = ResolveEndpoints(options, command, report, interval);
+    std::string identity{};
+    const int resolved = ResolveEndpoints(options, command, report, interval, identity);
     if (resolved != exit_ok)
     {
         return resolved;
@@ -219,6 +224,11 @@ int RunCommand(const Options& options)
     }
 
     ManagerClient client{command, report};
+    if (!options.routerEndpoint.empty())
+    {
+        client.UseRouter(options.routerEndpoint,
+                         options.managerIdentity.empty() ? identity : options.managerIdentity);
+    }
     CommandReply reply{};
     std::string error{};
     const ClientCode sent = client.SendCommand(code, options.serviceName, options.timeout, reply, error);

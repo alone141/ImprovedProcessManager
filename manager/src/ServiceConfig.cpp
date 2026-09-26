@@ -13,6 +13,9 @@ namespace process_manager
 namespace
 {
 
+// libzmq allows identities up to 255 bytes.
+constexpr std::size_t max_identity_length = 255;
+
 bool SameEnvironment(std::span<const EnvironmentVariable> a, std::span<const EnvironmentVariable> b)
 {
     if (a.size() != b.size())
@@ -73,6 +76,23 @@ bool IsValidServiceName(std::string_view name)
     for (const char c : name)
     {
         if (!IsNameCharacter(c))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool IsValidIdentity(std::string_view identity)
+{
+    if (identity.empty() || identity.size() > max_identity_length)
+    {
+        return false;
+    }
+
+    for (const char c : identity)
+    {
+        if (c <= ' ' || c > '~')
         {
             return false;
         }

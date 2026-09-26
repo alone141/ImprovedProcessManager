@@ -90,7 +90,8 @@ ParseCode ParseCommandLine(std::span<const std::string> arguments, Options& out,
         const bool wantsValue = flag == "-c" || flag == "--config" || flag == "-s" || flag == "--start" ||
                                 flag == "-k" || flag == "--stop" || flag == "-r" || flag == "--restart" ||
                                 flag == "--heartbeat" || flag == "--command" || flag == "--report" ||
-                                flag == "--timeout" || flag == "--log-level";
+                                flag == "--router" || flag == "--manager" || flag == "--timeout" ||
+                                flag == "--log-level";
         if (wantsValue && !TakeValue(arguments, i, hasInlineValue, value))
         {
             error = flag + " needs a value";
@@ -160,6 +161,24 @@ ParseCode ParseCommandLine(std::span<const std::string> arguments, Options& out,
         {
             options.reportEndpoint = value;
         }
+        else if (flag == "--router")
+        {
+            if (value.empty())
+            {
+                error = "--router needs an endpoint such as tcp://127.0.0.1:5558";
+                return ParseCode::InvalidValue;
+            }
+            options.routerEndpoint = value;
+        }
+        else if (flag == "--manager")
+        {
+            if (!IsValidIdentity(value))
+            {
+                error = "--manager must be 1 to 255 printable characters without spaces";
+                return ParseCode::InvalidValue;
+            }
+            options.managerIdentity = value;
+        }
         else if (flag == "--timeout")
         {
             long long ms = 0;
@@ -228,6 +247,10 @@ std::string UsageText(std::string_view program)
            "                          (default: from the configuration, else tcp://127.0.0.1:5557)\n"
            "      --report ENDPOINT   the manager's detailed report endpoint\n"
            "                          (default: from the configuration, else tcp://127.0.0.1:6668)\n"
+           "      --router ENDPOINT   send the command through a router (beraynetworkmanager)\n"
+           "                          instead of the command endpoint\n"
+           "      --manager NAME      with --router: the manager's identity on the router\n"
+           "                          (default: from the configuration, else berayprocessmanager)\n"
            "      --timeout MS        how long client modes wait for the manager (default: 3000)\n"
            "      --log-level LEVEL   error, warning, info or debug (run mode)\n"
            "  -v, --verbose           same as --log-level debug\n"

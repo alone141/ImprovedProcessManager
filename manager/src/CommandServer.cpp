@@ -10,30 +10,9 @@
 namespace process_manager
 {
 
-CommandServer::CommandServer(ZmqContext& context)
-    : router{context, SocketType::Router}
+RequestCode ParseCommandRequest(const Message& message, CommandRequest& out, std::string& problem)
 {
-}
-
-ZmqCode CommandServer::Bind(const std::string& endpoint, std::string& error)
-{
-    router.SetOption(SocketOption::RouterHandover, 1);
-    if (endpoint.find('[') != std::string::npos)
-    {
-        router.SetOption(SocketOption::Ipv6, 1);
-    }
-    if (router.Bind(endpoint) != ZmqCode::Ok)
-    {
-        error = "cannot bind " + endpoint + ": " + router.LastError();
-        return ZmqCode::Failed;
-    }
-    return ZmqCode::Ok;
-}
-
-RequestCode CommandServer::Receive(CommandRequest& out, std::string& problem)
-{
-    Message message{};
-    if (router.Receive(message, true) != ZmqCode::Ok || message.empty())
+    if (message.empty())
     {
         return RequestCode::Empty;
     }
@@ -65,7 +44,7 @@ RequestCode CommandServer::Receive(CommandRequest& out, std::string& problem)
     return RequestCode::Ok;
 }
 
-ZmqCode CommandServer::Reply(const CommandRequest& request, const CommandReply& reply)
+Message BuildCommandReply(const CommandRequest& request, const CommandReply& reply)
 {
     Message message{request.identity};
     if (request.delimiter)
@@ -74,7 +53,42 @@ ZmqCode CommandServer::Reply(const CommandRequest& request, const CommandReply& 
     }
     message.push_back(MakeFrame(command_tag));
     message.push_back(EncodeReply(reply));
-    return router.Send(message, true);
+    return message;
+}
+
+CommandServer::CommandServer(ZmqContext& context)
+    : router{context, SocketType::Router}
+{
+}
+
+ZmqCode CommandServer::Bind(const std::string& endpoint, std::string& error)
+{
+    router.SetOption(SocketOption::RouterHandover, 1);
+    if (endpoint.find('[') != std::string::npos)
+    {
+        router.SetOption(SocketOption::Ipv6, 1);
+    }
+    if (router.Bind(endpoint) != ZmqCode::Ok)
+    {
+        error = "cannot bind " + endpoint + ": " + router.LastError();
+        return ZmqCode::Failed;
+    }
+    return ZmqCode::Ok;
+}
+
+RequestCode CommandServer::Receive(CommandRequest& out, std::string& problem)
+{
+    Message message{};
+    if (router.Receive(message, true) != ZmqCode::Ok)
+    {
+        return RequestCode::Empty;
+    }
+    return ParseCommandRequest(message, out, problem);
+}
+
+ZmqCode CommandServer::Reply(const CommandRequest& request, const CommandReply& reply)
+{
+    return router.Send(BuildCommandReply(request, reply), true);
 }
 
 ZmqSocket& CommandServer::Socket()

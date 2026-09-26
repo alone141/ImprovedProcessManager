@@ -44,6 +44,7 @@ if(WIN32)
     set(PROCESS_MANAGER_PLATFORM_SOURCES
         windows/Console.cpp
         windows/NativeLauncher.cpp
+        windows/PeerAddress.cpp
         windows/ProcessTable.cpp
         windows/SignalWatcher.cpp
         windows/SystemMonitor.cpp
@@ -52,6 +53,7 @@ else()
     set(PROCESS_MANAGER_PLATFORM_SOURCES
         posix/Console.cpp
         posix/NativeLauncher.cpp
+        posix/PeerAddress.cpp
         posix/ProcessTable.cpp
         posix/SignalWatcher.cpp
         posix/SystemMonitor.cpp
@@ -74,6 +76,7 @@ add_library(process_manager_core STATIC
     ProcessLauncher.cpp
     ProcessTable.cpp
     ReportBuilder.cpp
+    RouterOptions.cpp
     Service.cpp
     ServiceConfig.cpp
     ServiceManager.cpp
@@ -86,15 +89,20 @@ target_include_directories(process_manager_core PUBLIC ${PROJECT_SOURCE_DIR}/inc
 find_package(Threads REQUIRED) # pthread_sigmask is in libpthread before glibc 2.34
 target_link_libraries(process_manager_core PUBLIC ${CMAKE_DL_LIBS} Threads::Threads)
 if(WIN32)
-    target_link_libraries(process_manager_core PUBLIC user32 shell32)
+    # ws2_32: getpeername and inet_ntop for the router's connection log.
+    target_link_libraries(process_manager_core PUBLIC user32 shell32 ws2_32)
 endif()
 
-# The ZeroMQ side: sockets, the publishers, the command server, the client and the daemon loop.
+# The ZeroMQ side: sockets, the publishers, the command server, the router and
+# the manager's link to it, the client and the daemon loop.
 add_library(process_manager_net STATIC
     CommandServer.cpp
     Daemon.cpp
+    Envelope.cpp
     ManagerClient.cpp
+    MessageRouter.cpp
     ReportPublisher.cpp
+    RouterLink.cpp
     ZmqSocket.cpp)
 target_link_libraries(process_manager_net PUBLIC process_manager_core PRIVATE ${PROCESS_MANAGER_ZMQ})
 if(PROCESS_MANAGER_ZMQ STREQUAL "libzmq-static")
@@ -104,4 +112,8 @@ endif()
 add_executable(berayprocessmanager main.cpp)
 target_link_libraries(berayprocessmanager PRIVATE process_manager_net)
 
-install(TARGETS berayprocessmanager RUNTIME DESTINATION bin)
+# The router: the NetworkManager design as a second program on the same libraries.
+add_executable(beraynetworkmanager RouterMain.cpp)
+target_link_libraries(beraynetworkmanager PRIVATE process_manager_net)
+
+install(TARGETS berayprocessmanager beraynetworkmanager RUNTIME DESTINATION bin)

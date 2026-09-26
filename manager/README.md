@@ -7,6 +7,12 @@ GUI in `../gui` reads. The same binary is also the command-line client: it
 prints the status table and starts, stops and restarts services of a running
 manager.
 
+A second program, `beraynetworkmanager`, is a ZeroMQ identity router (the
+NetworkManager design brought into this tree): peers connect to it under a name
+and address each other by name. With `router_endpoint` in its configuration the
+manager serves commands through the router as well as directly, so clients
+reach it by identity and several managers can share one router.
+
 Linux is the primary platform; Windows is supported. The wire format is in
 [`../docs/protocol.md`](../docs/protocol.md).
 
@@ -27,6 +33,7 @@ cmake --build build -j
 ctest --test-dir build
 ```
 
+The build puts `berayprocessmanager` and `beraynetworkmanager` in `build/src`.
 `-DCMAKE_COMPILE_WARNING_AS_ERROR=ON` turns compiler warnings into errors in the
 project's own code. Without GoogleTest, configure with
 `-DPROCESS_MANAGER_BUILD_TESTS=OFF`. For a
@@ -68,6 +75,14 @@ shows that unit. It runs the manager as `Type=notify`, with `Delegate=yes` so it
 can create a cgroup per service, and with `KillMode=mixed` so the manager stops
 the services itself on `systemctl stop`.
 
+The router has its own unit, for the host that should carry the commands:
+
+```bash
+sudo cp packaging/beraynetworkmanager.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now beraynetworkmanager
+```
+
 ## Command line
 
 ```text
@@ -86,6 +101,20 @@ berayprocessmanager --check [--config FILE]      validate a configuration
 the executable). Client modes read the endpoints from it when it exists, so
 `--status` finds a manager on custom ports; `--command` and `--report` override
 them, and `--timeout MS` sets how long to wait (3000 by default).
+
+`--router ENDPOINT` sends a command through the router instead of to the
+command endpoint, to the manager named by `--manager NAME` (the configuration's
+`identity`, else `berayprocessmanager`). `--status` always reads the report
+socket directly.
+
+```text
+beraynetworkmanager [--bind ENDPOINT] [--log-level LEVEL]   run the router (default tcp://*:5558)
+```
+
+`--log-level debug` logs every forwarded message; the default logs where it
+listens, which identities appear and go, and what it drops. It stops on
+`SIGTERM` or `SIGINT` (Ctrl+C). Exit status: `0` stopped, `1` cannot listen,
+`2` usage error.
 
 Exit status: `0` done (or nothing to do), `1` refused or failed, `2` usage or
 configuration error, `3` no answer from the manager.
@@ -123,6 +152,8 @@ reported with their line; see [`config/services.conf`](config/services.conf).
 | `health_endpoint` | `tcp://*:6667` | simplified health report (the GUI's `--sub`) |
 | `report_endpoint` | `tcp://*:6668` | detailed report (the CLI's `--status`) |
 | `command_endpoint` | `tcp://*:5557` | commands (the GUI's `--dealer`) |
+| `router_endpoint` | none | also serve commands through the router at this endpoint, for example `tcp://127.0.0.1:5558` |
+| `identity` | `berayprocessmanager` | the manager's name on the router: 1 to 255 printable characters without spaces, unique per router |
 | `publish_interval_ms` | `1000` | 100 to 60000 |
 | `log_level` | `info` | `error`, `warning`, `info`, `debug` |
 | `cgroups` | `auto` | `auto`, `off`, `required` |
@@ -199,9 +230,22 @@ move.
 
 **Reload.** `--reload` or `SIGHUP` re-reads the file: new services are added
 (and started when `autostart`), removed ones are stopped and dropped, changed
-ones take their new settings at their next start. Endpoint, cgroup and GPU
-settings need a manager restart. A file with an error is rejected and the
-running configuration stays.
+ones take their new settings at their next start. Endpoint, router, identity,
+cgroup and GPU settings need a manager restart. A file with an error is
+rejected and the running configuration stays.
+
+**Through the router.** With `router_endpoint` set, the manager connects a
+DEALER to `beraynetworkmanager` under its `identity` and serves the commands
+that arrive there in the same loop as its own command socket; the reply goes
+back through the router to whoever asked. The link reconnects on its own while
+the router is away, and the router hands the identity over to the newest
+connection when the manager restarts. The router queues nothing: a command to
+a manager that is not connected is dropped with a warning in the router's log,
+and the client reports no answer after its timeout. The router's default port
+is 5558, so it can share a host with the manager's own command socket on 5557;
+the NetworkManager project's original binary binds 5557 and needs another host.
+Services get `BPM_ROUTER_ENDPOINT` and `BPM_MANAGER_IDENTITY` for heartbeats
+that travel the same way. The framing is in the protocol document.
 
 **Measuring.** Once per publish interval. CPU time, memory (resident), threads,
 open files and I/O are summed over every process of the service: the cgroup
@@ -231,11 +275,13 @@ There is no reload signal; use `--reload`.
 | `CgroupTree`, `ProcFs`, `ProcessTable`, `SystemMonitor`, `GpuMonitor` | measurements |
 | `HealthRecord`, `DetailedReport`, `CommandMessage`, `WireReader`, `WireWriter` | the wire format |
 | `ZmqSocket`, `ReportPublisher`, `CommandServer`, `ManagerClient` | ZeroMQ |
+| `MessageRouter`, `Envelope`, `RouterLink`, `RouterOptions`, `PeerAddress` | the router, its framing, the manager's link to it, its command line, and the peer address in its connection log (`src/posix`, `src/windows`) |
 | `CommandLine`, `StatusTable`, `Console` | the command line |
 | `Logger`, `Instant`, `SignalWatcher`, `SystemdNotifier` | support |
 
 `process_manager_core` holds everything but ZeroMQ; `process_manager_net` adds
-the sockets and the daemon; `tests/` has one GoogleTest file per module.
+the sockets, the router and the daemon; `tests/` has one GoogleTest file per
+module. `main.cpp` is the manager and `RouterMain.cpp` the router.
 
 ## Style notes
 

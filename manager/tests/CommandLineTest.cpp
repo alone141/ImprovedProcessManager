@@ -46,6 +46,26 @@ TEST(CommandLineTest, ParsesServiceCommands)
     EXPECT_EQ(options.mode, process_manager::Mode::Stop);
 }
 
+TEST(CommandLineTest, ParsesRouterOptions)
+{
+    process_manager::Options options{};
+    ASSERT_EQ(Parse({"--stop", "x", "--router", "tcp://rig:5558", "--manager", "bpm-rig01"}, options),
+              process_manager::ParseCode::Ok);
+    EXPECT_EQ(options.mode, process_manager::Mode::Stop);
+    EXPECT_EQ(options.routerEndpoint, "tcp://rig:5558");
+    EXPECT_EQ(options.managerIdentity, "bpm-rig01");
+
+    ASSERT_EQ(Parse({"--reload", "--router=tcp://127.0.0.1:5558"}, options), process_manager::ParseCode::Ok);
+    EXPECT_EQ(options.routerEndpoint, "tcp://127.0.0.1:5558");
+    EXPECT_TRUE(options.managerIdentity.empty()); // from the configuration, else the default
+
+    EXPECT_EQ(Parse({"--router"}, options), process_manager::ParseCode::MissingValue);
+    EXPECT_EQ(Parse({"--router="}, options), process_manager::ParseCode::InvalidValue);
+    EXPECT_EQ(Parse({"--manager", "has space"}, options), process_manager::ParseCode::InvalidValue);
+    EXPECT_EQ(Parse({"--manager", ""}, options), process_manager::ParseCode::InvalidValue);
+    EXPECT_NE(process_manager::UsageText("x").find("--router"), std::string::npos);
+}
+
 TEST(CommandLineTest, ParsesStatusOptions)
 {
     process_manager::Options options{};

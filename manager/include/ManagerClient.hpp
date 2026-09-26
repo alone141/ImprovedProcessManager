@@ -20,7 +20,9 @@ enum class ClientCode
 };
 
 // The CLI side of the protocol. Commands use a DEALER without a fixed identity,
-// so the CLI never collides with a GUI connected as "PMC".
+// so the CLI never collides with a GUI connected as "PMC". Through a router the
+// same DEALER sends [manager identity]["BPM"][command] and reads the reply as
+// [manager identity]["BPM"][reply].
 class ManagerClient
 {
 public:
@@ -30,6 +32,13 @@ public:
      * @param reportEndpoint The manager's detailed report publisher, for example tcp://127.0.0.1:6668.
      */
     ManagerClient(std::string commandEndpoint, std::string reportEndpoint);
+
+    /**
+     * @brief Send commands through a router instead of to the command endpoint.
+     * @param endpoint The router, for example tcp://127.0.0.1:5558.
+     * @param managerIdentity The manager's name on the router.
+     */
+    void UseRouter(std::string endpoint, std::string managerIdentity);
 
     /**
      * @brief Send one command and wait for its reply.
@@ -56,6 +65,8 @@ private:
     ZmqContext context;
     std::string commandEndpoint;
     std::string reportEndpoint;
+    std::string routerEndpoint; // empty: commands go to commandEndpoint
+    std::string managerIdentity;
     std::unique_ptr<ZmqSocket> subscriber;
 };
 

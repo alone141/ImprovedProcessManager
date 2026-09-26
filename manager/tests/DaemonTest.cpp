@@ -6,10 +6,12 @@
 #include "DetailedReport.hpp"
 #include "HealthRecord.hpp"
 #include "ManagerClient.hpp"
+#include "MessageRouter.hpp"
 #include "ServiceConfig.hpp"
 #include "ServiceState.hpp"
 #include "ZmqSocket.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <string>
@@ -202,5 +204,88 @@ TEST(DaemonTest, BindFailureStopsTheStart)
     process_manager::Daemon daemon{config};
     std::string error{};
     EXPECT_EQ(daemon.Start(error), process_manager::DaemonCode::BindFailed);
+    EXPECT_NE(error.find("nonsense"), std::string::npos) << error;
+}
+
+TEST(DaemonTest, ServesCommandsThroughARouterAsWell)
+{
+    // The router on its own thread, as beraynetworkmanager would be.
+    process_manager::ZmqContext routerContext{};
+    process_manager::MessageRouter router{routerContext};
+    std::string error{};
+    ASSERT_EQ(router.Bind("tcp://127.0.0.1:*", error), process_manager::ZmqCode::Ok) << error;
+    const std::string routerEndpoint = router.Endpoint(); // before the loop owns the socket
+    std::atomic<bool> stopRouter{false};
+    std::thread routing{[&router, &stopRouter]()
+                        {
+                            while (!stopRouter.load())
+                            {
+                                router.Step(std::chrono::milliseconds{20});
+                            }
+                        }};
+
+    process_manager::Config config = TestConfig();
+    config.manager.routerEndpoint = routerEndpoint;
+    config.manager.identity = "bpm-test";
+    process_manager::Daemon daemon{config};
+    ASSERT_EQ(daemon.Start(error), process_manager::DaemonCode::Ok) << error;
+    std::thread loop{[&daemon]()
+                     {
+                         daemon.Run();
+                     }};
+
+    process_manager::ManagerClient client{process_manager::ConnectEndpoint(daemon.CommandEndpoint()),
+                                          process_manager::ConnectEndpoint(daemon.ReportEndpoint())};
+    process_manager::DetailedReport report{};
+    EXPECT_TRUE(AwaitReport(
+        client,
+        [](const process_manager::DetailedReport& seen)
+        { return InState(seen, "sleeper", process_manager::ServiceState::Running); },
+        report));
+
+    // Through the router: the first tries may meet a router that has not seen the
+    // manager's link yet, so the client retries until a reply comes back.
+    client.UseRouter(routerEndpoint, "bpm-test");
+    process_manager::CommandReply reply{};
+    process_manager::ClientCode code = process_manager::ClientCode::Timeout;
+    for (int attempt = 0; attempt < 10 && code == process_manager::ClientCode::Timeout; ++attempt)
+    {
+        code = client.SendCommand(process_manager::CommandCode::Stop, "sleeper", std::chrono::seconds{1}, reply, error);
+    }
+    ASSERT_EQ(code, process_manager::ClientCode::Ok) << error;
+    EXPECT_EQ(reply.result, process_manager::CommandResult::Ok);
+    EXPECT_EQ(reply.serviceName, "sleeper");
+    EXPECT_TRUE(AwaitReport(
+        client,
+        [](const process_manager::DetailedReport& seen)
+        { return InState(seen, "sleeper", process_manager::ServiceState::Stopped); },
+        report));
+
+    // A wrong identity on the router reaches nobody.
+    client.UseRouter(routerEndpoint, "someone-else");
+    EXPECT_EQ(client.SendCommand(process_manager::CommandCode::Start, "sleeper", std::chrono::milliseconds{300}, reply,
+                                 error),
+              process_manager::ClientCode::Timeout);
+
+    // The direct socket keeps working alongside.
+    client.UseRouter("", "");
+    ASSERT_EQ(client.SendCommand(process_manager::CommandCode::Start, "sleeper", std::chrono::seconds{5}, reply, error),
+              process_manager::ClientCode::Ok)
+        << error;
+    EXPECT_EQ(reply.result, process_manager::CommandResult::Ok);
+
+    daemon.RequestStop();
+    loop.join();
+    stopRouter.store(true);
+    routing.join();
+}
+
+TEST(DaemonTest, ARouterEndpointThatCannotBeConnectedStopsTheStart)
+{
+    process_manager::Config config = TestConfig();
+    config.manager.routerEndpoint = "nonsense";
+    process_manager::Daemon daemon{config};
+    std::string error{};
+    EXPECT_EQ(daemon.Start(error), process_manager::DaemonCode::RouterFailed);
     EXPECT_NE(error.find("nonsense"), std::string::npos) << error;
 }

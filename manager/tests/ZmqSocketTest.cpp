@@ -30,6 +30,42 @@ TEST(ZmqSocketTest, FramesCompareByContent)
     EXPECT_FALSE(process_manager::ZmqVersion().empty());
 }
 
+TEST(ZmqSocketTest, AMandatoryRouterReportsUnknownPeers)
+{
+    process_manager::ZmqContext context{};
+    process_manager::ZmqSocket router{context, process_manager::SocketType::Router};
+    ASSERT_EQ(router.SetOption(process_manager::SocketOption::RouterMandatory, 1), process_manager::ZmqCode::Ok);
+    ASSERT_EQ(router.Bind("tcp://127.0.0.1:*"), process_manager::ZmqCode::Ok) << router.LastError();
+    const process_manager::Message message{process_manager::MakeFrame("nobody"), process_manager::MakeFrame("x")};
+    EXPECT_EQ(router.Send(message, true), process_manager::ZmqCode::Unreachable);
+    EXPECT_FALSE(router.LastError().empty());
+}
+
+TEST(ZmqSocketTest, MonitorsAcceptedConnections)
+{
+    process_manager::ZmqContext context{};
+    process_manager::ZmqSocket router{context, process_manager::SocketType::Router};
+    ASSERT_EQ(router.MonitorConnections("inproc://zmq-socket-test-monitor"), process_manager::ZmqCode::Ok)
+        << router.LastError();
+    process_manager::ZmqSocket events{context, process_manager::SocketType::Pair};
+    ASSERT_EQ(events.Connect("inproc://zmq-socket-test-monitor"), process_manager::ZmqCode::Ok);
+    ASSERT_EQ(router.Bind("tcp://127.0.0.1:*"), process_manager::ZmqCode::Ok) << router.LastError();
+
+    process_manager::ZmqSocket dealer{context, process_manager::SocketType::Dealer};
+    ASSERT_EQ(dealer.Connect(router.BoundEndpoint()), process_manager::ZmqCode::Ok);
+    ASSERT_TRUE(WaitReadable(events, std::chrono::seconds{5}));
+    process_manager::Message message{};
+    ASSERT_EQ(events.Receive(message, true), process_manager::ZmqCode::Ok);
+    process_manager::SocketEvent event{};
+    ASSERT_TRUE(process_manager::DecodeSocketEvent(message, event));
+    EXPECT_EQ(event.kind, process_manager::SocketEventKind::Accepted);
+    EXPECT_EQ(event.endpoint, router.BoundEndpoint());
+    EXPECT_NE(event.descriptor, 0u);
+
+    process_manager::SocketEvent none{};
+    EXPECT_FALSE(process_manager::DecodeSocketEvent(process_manager::Message{process_manager::Frame{1, 2}}, none));
+}
+
 TEST(ZmqSocketTest, RouterAndDealerExchangeMultipartMessages)
 {
     process_manager::ZmqContext context{};

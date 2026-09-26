@@ -8,6 +8,7 @@
 #include "NativeLauncher.hpp"
 #include "ReportBuilder.hpp"
 #include "ReportPublisher.hpp"
+#include "RouterLink.hpp"
 #include "ServiceConfig.hpp"
 #include "ServiceManager.hpp"
 #include "SystemMonitor.hpp"
@@ -28,6 +29,7 @@ enum class DaemonCode
     Ok,
     CgroupsUnavailable,
     BindFailed,
+    RouterFailed,
 };
 
 class Daemon
@@ -43,8 +45,8 @@ public:
     Daemon& operator=(const Daemon&) = delete;
 
     /**
-     * @brief Set up cgroups and GPU monitoring, bind the three sockets and start the
-     *        autostart services.
+     * @brief Set up cgroups and GPU monitoring, bind the three sockets, connect to the router
+     *        when the configuration names one, and start the autostart services.
      * @param error Receives the reason on failure.
      * @return DaemonCode::Ok, or the step that failed.
      */
@@ -95,7 +97,7 @@ public:
 private:
     void SetUpCgroups();
     void RemoveTaskGroups(std::span<const std::string> names);
-    void HandleCommands(const Instant& now);
+    void HandleCommands(CommandSource& source, const Instant& now);
     CommandReply Reload(const Instant& now);
     void Publish(const Instant& now);
     void BeginShutdown(const Instant& now);
@@ -111,6 +113,7 @@ private:
     ZmqContext context;
     std::unique_ptr<ReportPublisher> publisher;
     std::unique_ptr<CommandServer> server;
+    std::unique_ptr<RouterLink> link; // only with a router_endpoint
     std::atomic<bool> stopRequested;
     std::atomic<bool> reloadRequested;
     std::optional<LogLevel> logLevelOverride;

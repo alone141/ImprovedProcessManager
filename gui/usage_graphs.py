@@ -1,13 +1,12 @@
 """Usage graphs: CPU, memory and GPU use per process over recent time.
 
 Samples are recorded by the main window from health reports (GPU columns
-from the manager's detailed report, or from nvidia-smi without one). The
-charts are drawn with QPainter, so graphing needs no dependency beyond PyQt6.
+from nvidia-smi). The charts are drawn with QPainter, so graphing needs no
+dependency beyond PyQt6.
 """
 
 from __future__ import annotations
 
-import dataclasses
 import html
 import math
 import time
@@ -59,7 +58,7 @@ class UsageSample:
     mem_bytes: Optional[int]
     gpu_pct: Optional[float]  # None: no GPU data
     vram_bytes: Optional[int]
-    state: Optional[int] = None  # process_views.DisplayState value; None when not recorded
+    state: Optional[int] = None  # RuntimeState value; None when not recorded
 
 
 class UsageHistory:
@@ -79,15 +78,8 @@ class UsageHistory:
         two and a half report intervals counts as a hole in the graphs."""
         self.gap_sec = max(self.MIN_GAP_SEC, 2.5 * seconds)
 
-    def add(self, name: str, sample: UsageSample, replace_since: Optional[float] = None) -> None:
-        """Append ``sample``, at most one a second. With ``replace_since``, it
-        takes the place of a last sample taken at or after that time instead
-        (the same manager snapshot, recorded a moment before from the other
-        socket), at that sample's time."""
+    def add(self, name: str, sample: UsageSample) -> None:
         series = self._series.setdefault(name, deque())
-        if replace_since is not None and series and series[-1].t >= replace_since:
-            series[-1] = dataclasses.replace(sample, t=series[-1].t)
-            return
         if series and sample.t - series[-1].t < self.MIN_INTERVAL_SEC:
             return
         series.append(sample)
@@ -204,7 +196,7 @@ class Metric:
     empty_text: str
 
 
-NO_GPU_TEXT = "No GPU data (no figures from the manager, nvidia-smi unavailable)"
+NO_GPU_TEXT = "No GPU data (nvidia-smi unavailable)"
 METRICS = (
     Metric("CPU %  (100 = one core)", lambda s: s.cpu_pct, False, 10.0, "No data yet"),
     Metric("Memory", lambda s: s.mem_bytes, True, 16 * 1024.0**2, "No data yet"),

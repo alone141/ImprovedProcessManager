@@ -15,7 +15,6 @@ import bisect
 import html
 import re
 import time
-from enum import IntEnum
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, pyqtSignal
@@ -26,7 +25,6 @@ from PyQt6.QtGui import (
     QPainter,
     QPainterPath,
     QPalette,
-    QPen,
     QTextOption,
 )
 from PyQt6.QtWidgets import (
@@ -55,18 +53,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from health_structs import (
-    ALL_SERVICES,
-    RESTART_MODE_TEXT,
-    CommandEnum,
-    RuntimeState,
-    ServiceState,
-    exit_text,
-    format_bytes,
-    format_duration_ns,
-    format_duration_short,
-    service_state_text,
-)
+from health_structs import CommandEnum, RuntimeState, format_bytes, format_duration_ns
 from journal_view import JournalView
 from systemd_logs import SERVICE_UNIT, task_cgroup_name
 from ui_scale import MONO_FONT_FAMILIES, ui_font, ui_point_size
@@ -98,123 +85,23 @@ TEXT_MUTED = "#888888"
 DANGER = "#f44336"
 STALE_COLOR = QColor("#777777")
 
-
-class DisplayState(IntEnum):
-    """The state the pages show: the manager's eight (the ServiceState values
-    of the detailed report), and UNKNOWN, which only a manager that sends
-    nothing but the health record's five states can leave us with."""
-
-    STOPPED = 0
-    WAITING = 1
-    STARTING = 2
-    RUNNING = 3
-    UNHEALTHY = 4
-    STOPPING = 5
-    BACKOFF = 6
-    FAILED = 7
-    UNKNOWN = -1
-
-
-# The health record says less: each of its five states stands for one of ours.
-_FROM_RUNTIME: Dict[RuntimeState, DisplayState] = {
-    RuntimeState.UNKNOWN: DisplayState.UNKNOWN,
-    RuntimeState.STARTING: DisplayState.STARTING,
-    RuntimeState.RUNNING: DisplayState.RUNNING,
-    RuntimeState.STOPPED: DisplayState.STOPPED,
-    RuntimeState.UNHEALTHY: DisplayState.UNHEALTHY,
+STATE_COLORS: Dict[RuntimeState, str] = {
+    RuntimeState.UNKNOWN: "#9c27b0",
+    RuntimeState.STARTING: "#ff9800",
+    RuntimeState.RUNNING: "#4caf50",
+    RuntimeState.STOPPED: "#9e9e9e",
+    RuntimeState.UNHEALTHY: "#f44336",
 }
-
-# How the manager folds its eight states into the health record's five
-# (docs/protocol.md). The buttons follow it, so they allow what they did when
-# only the five were known.
-_FOLD: Dict[DisplayState, RuntimeState] = {
-    DisplayState.UNKNOWN: RuntimeState.UNKNOWN,
-    DisplayState.STOPPED: RuntimeState.STOPPED,
-    DisplayState.STOPPING: RuntimeState.STOPPED,
-    DisplayState.WAITING: RuntimeState.STARTING,
-    DisplayState.STARTING: RuntimeState.STARTING,
-    DisplayState.BACKOFF: RuntimeState.STARTING,
-    DisplayState.RUNNING: RuntimeState.RUNNING,
-    DisplayState.UNHEALTHY: RuntimeState.UNHEALTHY,
-    DisplayState.FAILED: RuntimeState.UNHEALTHY,
+STATE_LABELS: Dict[RuntimeState, str] = {
+    RuntimeState.UNKNOWN: "Unknown",
+    RuntimeState.STARTING: "Starting",
+    RuntimeState.RUNNING: "Running",
+    RuntimeState.STOPPED: "Stopped",
+    RuntimeState.UNHEALTHY: "Unhealthy",
 }
-
-
-def display_state(state) -> DisplayState:
-    """The display state of either feed's state: a ServiceState from the
-    detailed report, a RuntimeState from the health record, or one already."""
-    if isinstance(state, DisplayState):
-        return state
-    if isinstance(state, ServiceState):
-        return DisplayState(int(state))
-    if isinstance(state, RuntimeState):
-        return _FROM_RUNTIME[state]
-    return DisplayState.UNKNOWN
-
-
-def stored_state(value: int) -> DisplayState:
-    """A display state kept as a plain int (the usage history's samples)."""
-    try:
-        return DisplayState(value)
-    except ValueError:
-        return DisplayState.UNKNOWN
-
-
-# The five the health record knows keep their colours. The four only the
-# detailed report has were checked for contrast on the tiles and for distance
-# from the states they sit next to in the state band.
-STATE_COLORS: Dict[DisplayState, str] = {
-    DisplayState.UNKNOWN: "#9c27b0",
-    DisplayState.STOPPED: "#9e9e9e",
-    DisplayState.WAITING: "#03a9f4",
-    DisplayState.STARTING: "#ff9800",
-    DisplayState.RUNNING: "#4caf50",
-    DisplayState.UNHEALTHY: "#f44336",
-    DisplayState.STOPPING: "#cfd8dc",
-    DisplayState.BACKOFF: "#ffe57f",
-    DisplayState.FAILED: "#ea80fc",
-}
-STATE_LABELS: Dict[DisplayState, str] = {
-    DisplayState.UNKNOWN: "Unknown",
-    DisplayState.STOPPED: "Stopped",
-    DisplayState.WAITING: "Waiting",
-    DisplayState.STARTING: "Starting",
-    DisplayState.RUNNING: "Running",
-    DisplayState.UNHEALTHY: "Unhealthy",
-    DisplayState.STOPPING: "Stopping",
-    DisplayState.BACKOFF: "Backoff",
-    DisplayState.FAILED: "Failed",
-}
-STATE_MEANINGS: Dict[DisplayState, str] = {
-    DisplayState.RUNNING: "running",
-    DisplayState.STARTING: "started, not yet counted as running",
-    DisplayState.WAITING: "waiting for the services it depends on",
-    DisplayState.BACKOFF: "exited; the manager restarts it after a delay",
-    DisplayState.UNHEALTHY: "running, but its heartbeats are missing",
-    DisplayState.FAILED: (
-        "will not be restarted: it exited with an error its restart policy does not "
-        "cover, used up its restarts, or a service it depends on failed; Start tries again"
-    ),
-    DisplayState.STOPPING: "asked to stop; its processes are exiting",
-    DisplayState.STOPPED: "not running",
-    DisplayState.UNKNOWN: "the manager did not say",
-}
-# States on their way to another one. The state band stripes them, so they
-# differ from their neighbours by more than colour.
-TRANSITIONAL_STATES = (
-    DisplayState.WAITING,
-    DisplayState.STARTING,
-    DisplayState.STOPPING,
-    DisplayState.BACKOFF,
-)
 # States with a live process, where an uptime means something.
-ALIVE_STATES = (
-    DisplayState.STARTING,
-    DisplayState.RUNNING,
-    DisplayState.UNHEALTHY,
-    DisplayState.STOPPING,
-)
-# Which command makes sense in which of the health record's states.
+ALIVE_STATES = (RuntimeState.STARTING, RuntimeState.RUNNING, RuntimeState.UNHEALTHY)
+# Which command makes sense in which state.
 ACTION_STATES: Dict[CommandEnum, Tuple[RuntimeState, ...]] = {
     CommandEnum.START: (RuntimeState.STOPPED, RuntimeState.UNKNOWN, RuntimeState.UNHEALTHY),
     CommandEnum.STOP: (RuntimeState.RUNNING, RuntimeState.STARTING, RuntimeState.UNHEALTHY),
@@ -240,21 +127,7 @@ ACTION_STYLES: Dict[CommandEnum, str] = {
     CommandEnum.START: _action_style("#2e7d32", "#388e3c"),
     CommandEnum.STOP: _action_style("#c62828", "#d32f2f"),
     CommandEnum.RESTART: _action_style("#ef6c00", "#fb8c00"),
-    CommandEnum.RELOAD: _action_style("#37474f", "#455a64"),
 }
-
-# The manager page's whole-manager actions: label, tooltip.
-MANAGER_ACTIONS: Tuple[Tuple[CommandEnum, str, str], ...] = (
-    (CommandEnum.START, "Start all", "Start every service, each after what it depends on"),
-    (CommandEnum.STOP, "Stop all", "Stop every service at once"),
-    (CommandEnum.RESTART, "Restart all", "Restart every service"),
-    (
-        CommandEnum.RELOAD,
-        "Reload configuration",
-        "Re-read the configuration file: new services are added (and started when autostart), "
-        "removed ones are stopped, changed ones take their settings at their next start",
-    ),
-)
 
 TAB_STYLE = f"""
     QTabWidget::pane {{ border: 1px solid {BORDER}; background: {BG}; }}
@@ -300,44 +173,8 @@ def mono_style(color: str) -> str:
 # ── pure helpers ─────────────────────────────────────────────────────────────
 
 
-def state_color(state) -> str:
-    return STATE_COLORS[display_state(state)]
-
-
-def restart_wait_ns(report: dict) -> int:
-    """How long until the scheduled restart of a service in backoff, as of the
-    snapshot, rounded up to a whole second, so a countdown never reads 0s
-    while the restart is still to come; 0 when none is scheduled (or only the
-    health record is known)."""
-    wait = int(report.get("nextRestartTime", 0) or 0) - int(report.get("snapshotTime", 0) or 0)
-    second = 1_000_000_000
-    return -(-wait // second) * second if wait > 0 else 0
-
-
-def state_text(report: dict) -> str:
-    """The state pill's text: the state, with the backoff countdown."""
-    state = display_state(report.get("state"))
-    wait = restart_wait_ns(report) if state == DisplayState.BACKOFF else 0
-    return STATE_LABELS[state] + (f" {format_duration_short(wait)}" if wait else "")
-
-
-def state_tooltip(state) -> str:
-    state = display_state(state)
-    return f"{STATE_LABELS[state]}: {STATE_MEANINGS[state]}"
-
-
-def state_legend_html() -> str:
-    """What the state colours mean, for tooltips."""
-    rows = "".join(
-        f"<tr><td style='color: {STATE_COLORS[state]}'>&#9632;</td>"
-        f"<td><b>{STATE_LABELS[state].lower()}</b></td><td>{html.escape(meaning)}</td></tr>"
-        for state, meaning in STATE_MEANINGS.items()
-    )
-    return (
-        "Process state over the last 15 minutes; a hole means no reports. "
-        "Striped: on its way to another state."
-        f"<table cellspacing='4'>{rows}</table>"
-    )
+def state_color(state: RuntimeState) -> str:
+    return STATE_COLORS.get(state, "#ffffff")
 
 
 def tint(color: str, alpha: float = 0.18) -> str:
@@ -350,33 +187,6 @@ def pill_style(color: str) -> str:
     radius = max(6, int(ui_point_size() * 0.9))
     return (
         f"QLabel {{ color: {color}; background: {tint(color)}; "
-        f"border-radius: {radius}px; padding: 1px {radius}px; font-weight: bold; }}"
-    )
-
-
-def _luminance(color: QColor) -> float:
-    """WCAG relative luminance."""
-
-    def channel(value: int) -> float:
-        v = value / 255.0
-        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
-
-    return 0.2126 * channel(color.red()) + 0.7152 * channel(color.green()) + 0.0722 * channel(color.blue())
-
-
-def ink_for(color: str) -> str:
-    """Black or white, whichever reads better on ``color``."""
-    lum = _luminance(QColor(color))
-    return "#000000" if (lum + 0.05) / 0.05 >= 1.05 / (lum + 0.05) else "#ffffff"
-
-
-def solid_pill_style(color: str) -> str:
-    """A pill filled with ``color``: it reads the same on the light page and on
-    a dark one, whatever the colour (text in its colour would not, for the pale
-    ones)."""
-    radius = max(6, int(ui_point_size() * 0.9))
-    return (
-        f"QLabel {{ color: {ink_for(color)}; background: {color}; "
         f"border-radius: {radius}px; padding: 1px {radius}px; font-weight: bold; }}"
     )
 
@@ -397,13 +207,13 @@ def segment_style(first: bool, last: bool) -> str:
     )
 
 
-def action_enabled(command: CommandEnum, state) -> bool:
-    return _FOLD[display_state(state)] in ACTION_STATES[command]
+def action_enabled(command: CommandEnum, state: RuntimeState) -> bool:
+    return state in ACTION_STATES[command]
 
 
-def uptime_text(state, start_ns: int, snap_ns: int) -> str:
+def uptime_text(state: RuntimeState, start_ns: int, snap_ns: int) -> str:
     # A stopped process keeps its last start time; that isn't an uptime.
-    if display_state(state) not in ALIVE_STATES or not start_ns:
+    if state not in ALIVE_STATES or not start_ns:
         return "—"
     return format_duration_ns(snap_ns - start_ns)
 
@@ -451,200 +261,21 @@ def gpu_texts(gpu) -> Tuple[str, str]:
 
 
 def row_hint(report: dict) -> Tuple[str, str]:
-    """Right-hand text of a sidebar row and its kind: "cpu", "badge" (in the
-    state's colour) or "muted"."""
-    state = display_state(report["state"])
-    if state == DisplayState.UNHEALTHY:
+    """Right-hand text of a sidebar row and its kind: "cpu", "badge" or "muted"."""
+    state = report["state"]
+    if state == RuntimeState.UNHEALTHY:
         missed = int(report.get("missedBeats", 0) or 0)
         return (f"{missed} missed" if missed else "unhealthy"), "badge"
-    if state == DisplayState.FAILED:
-        return "failed", "badge"
-    if state == DisplayState.BACKOFF:
-        wait = restart_wait_ns(report)
-        return (f"restart in {format_duration_short(wait)}" if wait else "backoff"), "badge"
-    if state == DisplayState.RUNNING:
+    if state == RuntimeState.RUNNING:
         cpu = report.get("_cpu_pct")
         return ("—" if cpu is None else f"{cpu:.0f} %"), "cpu"
-    return STATE_LABELS[state].lower(), "muted"
+    return STATE_LABELS.get(state, state.name).lower(), "muted"
 
 
 def service_active_text(status_text: str) -> str:
     """The unit's active state ("active", "failed", …) from systemctl status."""
     match = re.search(r"^\s*Active:\s*(\S+)", status_text or "", re.MULTILINE)
     return match.group(1) if match else ""
-
-
-# ── the detailed report, as text ─────────────────────────────────────────────
-
-NO_REPORT_TEXT = (
-    "No detailed report from the manager (port 6668): the tiles show the health record only"
-)
-WAITING_REPORT_TEXT = "Waiting for the manager's detailed report (port 6668)…"
-
-# Rows of the process page's details panel, in display order. A value the
-# report does not have hides its row.
-DETAIL_ROWS = (
-    ("state", "Manager state"),
-    ("binary", "Binary"),
-    ("description", "Description"),
-    ("restart", "Restart policy"),
-    ("exit", "Last exit"),
-    ("next", "Next restart"),
-    ("procs", "Processes · threads · files"),
-    ("io", "I/O"),
-    ("peak", "Peak memory"),
-    ("limits", "Limits"),
-    ("accounting", "Accounting"),
-    ("heartbeat", "Heartbeat"),
-    ("gpu", "GPU (manager)"),
-)
-
-# Rows of the manager page's host overview.
-HOST_ROWS = (
-    ("host", "Host"),
-    ("manager", "Manager"),
-    ("publish", "Publishing"),
-    ("accounting", "Accounting"),
-    ("cpu", "CPU"),
-    ("memory", "Memory"),
-    ("load", "Load"),
-    ("uptime", "Host uptime"),
-    ("services", "Services"),
-    ("gpus", "GPUs"),
-)
-
-
-def ago_text(snapshot_ns: int, when_ns: int) -> str:
-    return format_duration_short(snapshot_ns - when_ns) + " ago"
-
-
-def details_values(record: dict, report: dict) -> Dict[str, str]:
-    """The details panel's rows for one service record of the detailed report."""
-    snapshot = int(report.get("snapshotTime", 0) or 0)
-    windows = bool(report.get("windows"))
-    values: Dict[str, str] = {"state": service_state_text(record, snapshot)}
-    values["binary"] = record.get("binary") or "—"
-    if record.get("description"):
-        values["description"] = record["description"]
-    policy = RESTART_MODE_TEXT.get(record.get("restartMode"), "—")
-    values["restart"] = policy + (" · autostart" if record.get("autostart") else "")
-    exit_time = int(record.get("lastExitTime", 0) or 0)
-    if exit_time:
-        values["exit"] = f"{exit_text(int(record.get('lastExitCode', 0)), windows)}, {ago_text(snapshot, exit_time)}"
-    else:
-        values["exit"] = "never"
-    next_restart = int(record.get("nextRestartTime", 0) or 0)
-    if next_restart > snapshot:
-        values["next"] = "in " + format_duration_short(next_restart - snapshot)
-    if record.get("usageValid"):
-        files = record.get("openFiles")
-        values["procs"] = (
-            f"{record.get('processCount', 0)} · {record.get('threadCount', 0)} · "
-            f"{'—' if files is None else files}"
-        )
-        values["io"] = (
-            f"read {format_bytes(int(record.get('ioReadBytes', 0)))} · "
-            f"written {format_bytes(int(record.get('ioWriteBytes', 0)))}"
-        )
-        values["peak"] = format_bytes(int(record.get("memoryPeakBytes", 0)))
-    limits = []
-    if record.get("memoryLimitBytes"):
-        limits.append("memory " + format_bytes(int(record["memoryLimitBytes"])))
-    if record.get("cpuLimitPercent"):
-        limits.append(f"CPU {record['cpuLimitPercent']} % of one core")
-    values["limits"] = " · ".join(limits) if limits else "none"
-    if record.get("cgroup"):
-        accounting = "cgroup " + task_cgroup_name(record.get("name", ""))
-        if record.get("oomKills"):
-            accounting += f" · {record['oomKills']} OOM kills"
-        values["accounting"] = accounting
-    else:
-        values["accounting"] = "session and descendants"
-    if record.get("heartbeat"):
-        beat = "supervised"
-        last_seen = int(record.get("lastSeen", 0) or 0)
-        if last_seen and record.get("state") in (ServiceState.RUNNING, ServiceState.UNHEALTHY):
-            beat += " · last beat " + ago_text(snapshot, last_seen)
-        if record.get("missedBeats"):
-            beat += f" · {record['missedBeats']} missed"
-        values["heartbeat"] = beat
-    else:
-        values["heartbeat"] = "not supervised"
-    if record.get("gpuValid"):
-        gpu = record.get("gpuPercent")
-        values["gpu"] = (
-            ("—" if gpu is None else f"{gpu:.1f} %")
-            + " · " + format_bytes(int(record.get("gpuMemoryBytes", 0)))
-        )
-    elif report.get("gpuMonitoring"):
-        values["gpu"] = "no GPU figures for this service"
-    return values
-
-
-def host_values(report: dict) -> Dict[str, str]:
-    """The host overview's rows for a detailed report's header and GPU records."""
-    snapshot = int(report.get("snapshotTime", 0) or 0)
-    values: Dict[str, str] = {"host": report.get("hostName") or "?"}
-    manager = f"v{report.get('managerVersion') or '?'} · PID {report.get('managerPid', 0)}"
-    started = int(report.get("managerStartTime", 0) or 0)
-    if started:
-        manager += " · up " + format_duration_short(snapshot - started)
-    if report.get("stopping"):
-        manager += " · shutting down"
-    values["manager"] = manager
-    interval = int(report.get("publishIntervalMs", 0) or 0)
-    values["publish"] = (
-        (f"every {interval / 1000:.1f} s" if interval else "interval unknown")
-        + f" · snapshot {snapshot_clock(snapshot)}"
-    )
-    accounting = "cgroups" if report.get("cgroups") else "sessions (no cgroups)"
-    accounting += " · GPU monitoring (NVML)" if report.get("gpuMonitoring") else " · no GPU monitoring"
-    if report.get("windows"):
-        accounting += " · Windows host"
-    values["accounting"] = accounting
-    cpu = report.get("hostCpuPercent")
-    cores = int(report.get("cpuCount", 0) or 0)
-    values["cpu"] = ("—" if cpu is None else f"{cpu:.1f} %") + (f" of {cores} cores" if cores else "")
-    total = int(report.get("memoryTotalBytes", 0) or 0)
-    available = int(report.get("memoryAvailableBytes", 0) or 0)
-    used = total - available if total > available else 0
-    values["memory"] = f"{format_bytes(used)} used of {format_bytes(total)}" if total else "—"
-    load = tuple(report.get("loadAverage") or ())
-    if len(load) == 3 and (any(load) or not report.get("windows")):
-        values["load"] = " ".join(f"{value:.2f}" for value in load)
-    uptime = int(report.get("uptimeSeconds", 0) or 0)
-    if uptime:
-        values["uptime"] = format_duration_short(uptime * 1_000_000_000)
-    services = report.get("services") or []
-    counts: Dict[str, int] = {}
-    for service in services:
-        state = service.get("state")
-        key = state.name.lower() if isinstance(state, ServiceState) else str(state)
-        counts[key] = counts.get(key, 0) + 1
-    summary = str(len(services))
-    if counts:
-        summary += " · " + " · ".join(f"{key} {count}" for key, count in sorted(counts.items()))
-    values["services"] = summary
-    gpus = report.get("gpus") or []
-    if gpus:
-        lines = []
-        for gpu in gpus:
-            util = gpu.get("utilizationPercent")
-            line = (
-                f"gpu{gpu.get('index', 0)} · {gpu.get('name') or '?'} · "
-                f"{'—' if util is None else f'{util:.0f} %'} busy · "
-                f"{format_bytes(int(gpu.get('memoryUsedBytes', 0)))} of "
-                f"{format_bytes(int(gpu.get('memoryTotalBytes', 0)))}"
-            )
-            if gpu.get("temperatureC"):
-                line += f" · {gpu['temperatureC']} °C"
-            if gpu.get("powerMilliwatts"):
-                line += f" · {gpu['powerMilliwatts'] / 1000:.0f} W"
-            lines.append(line)
-        values["gpus"] = "\n".join(lines)
-    elif report.get("gpuMonitoring"):
-        values["gpus"] = "none found"
-    return values
 
 
 # ── sidebar ──────────────────────────────────────────────────────────────────
@@ -695,17 +326,16 @@ class SidebarDelegate(QStyledItemDelegate):
         elif option.state & QStyle.StateFlag.State_MouseOver:
             painter.fillRect(rect, QColor(ROW_HOVER_BG))
 
-        badge_color = QColor(DANGER)
         if kind == "manager":
             dot = QColor(ACCENT)
             hint, hint_kind = (index.data(HINT_ROLE) or ""), "muted"
             name_color = QColor(TEXT)
         else:
             report = index.data(REPORT_ROLE) or {}
-            state = display_state(report.get("state"))
-            dot = badge_color = QColor(state_color(state))
+            state = report.get("state", RuntimeState.UNKNOWN)
+            dot = QColor(state_color(state))
             hint, hint_kind = row_hint(report) if report else ("", "muted")
-            name_color = QColor(TEXT_DIM if state == DisplayState.STOPPED else TEXT)
+            name_color = QColor(TEXT_DIM if state == RuntimeState.STOPPED else TEXT)
         if self.stale:
             dot, name_color, hint_kind = STALE_COLOR, STALE_COLOR, "muted"
 
@@ -728,11 +358,11 @@ class SidebarDelegate(QStyledItemDelegate):
                 badge_h = hfm.height() + 2
                 hint_w = text_w + pad * 1.6
                 badge = QRectF(right - hint_w, cy - badge_h / 2, hint_w, badge_h)
-                fill = QColor(badge_color)
+                fill = QColor(DANGER)
                 fill.setAlpha(56)
                 painter.setBrush(fill)
                 painter.drawRoundedRect(badge, badge_h / 2, badge_h / 2)
-                painter.setPen(badge_color)
+                painter.setPen(QColor(DANGER))
                 painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, hint)
             else:
                 hint_w = text_w
@@ -1007,96 +637,6 @@ class MetricTile(QFrame):
         self.val.setStyleSheet(f"color: {self.value_color()};")
 
 
-class KeyValuePanel(QFrame):
-    """A titled panel of label / value pairs, two pairs to a row, fed from a
-    dict of values keyed like ``rows``. A key missing from the values hides
-    its row; a hint line replaces the rows while there are no values."""
-
-    def __init__(
-        self,
-        title: str,
-        rows: Sequence[Tuple[str, str]],
-        hint: str,
-        parent: Optional[QWidget] = None,
-    ):
-        super().__init__(parent)
-        self.setObjectName("panel")
-        self.setStyleSheet(f"QFrame#panel {{ background: {TILE_BG}; border-radius: 6px; }}")
-        self._rows = tuple(rows)
-        self._shown: Tuple[str, ...] = ()
-        self._stale = False
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(10, 6, 10, 8)
-        outer.setSpacing(4)
-        self.lbl_title = QLabel(title)
-        self.lbl_title.setFont(ui_font(0.9))
-        self.lbl_title.setStyleSheet(f"color: {TEXT_DIM};")
-        outer.addWidget(self.lbl_title)
-        self.lbl_hint = QLabel(hint)
-        self.lbl_hint.setStyleSheet(f"color: {TEXT_MUTED};")
-        self.lbl_hint.setWordWrap(True)
-        outer.addWidget(self.lbl_hint)
-        self.grid = QGridLayout()
-        self.grid.setHorizontalSpacing(8)
-        self.grid.setVerticalSpacing(2)
-        outer.addLayout(self.grid)
-        self.labels: Dict[str, QLabel] = {}
-        self.values: Dict[str, QLabel] = {}
-        for key, label in self._rows:
-            lbl = QLabel(label)
-            lbl.setStyleSheet(f"color: {TEXT_MUTED};")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
-            val = QLabel("—")
-            val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            val.setWordWrap(True)
-            val.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-            lbl.hide()
-            val.hide()
-            self.labels[key] = lbl
-            self.values[key] = val
-        self._apply_color()
-
-    def set_values(self, values: Optional[Dict[str, str]]) -> None:
-        """Show ``values`` (None or empty: the hint instead of any row)."""
-        shown = tuple(key for key, _label in self._rows if values and key in values)
-        if shown != self._shown:
-            self._arrange(shown)
-        for key in shown:
-            self.values[key].setText(values[key])
-        self.lbl_hint.setVisible(not shown)
-
-    def set_hint(self, text: str) -> None:
-        self.lbl_hint.setText(text)
-
-    def shown_values(self) -> Dict[str, str]:
-        return {key: self.values[key].text() for key in self._shown}
-
-    def set_stale(self, stale: bool) -> None:
-        self._stale = stale
-        self._apply_color()
-
-    def _apply_color(self) -> None:
-        color = STALE_COLOR.name() if self._stale else TEXT
-        for val in self.values.values():
-            val.setStyleSheet(f"color: {color};")
-
-    def _arrange(self, shown: Tuple[str, ...]) -> None:
-        for key in self._shown:
-            self.grid.removeWidget(self.labels[key])
-            self.grid.removeWidget(self.values[key])
-            self.labels[key].hide()
-            self.values[key].hide()
-        for i, key in enumerate(shown):
-            row, pair = divmod(i, 2)
-            self.grid.addWidget(self.labels[key], row, pair * 2)
-            self.grid.addWidget(self.values[key], row, pair * 2 + 1)
-            self.labels[key].show()
-            self.values[key].show()
-        self.grid.setColumnStretch(1, 1)
-        self.grid.setColumnStretch(3, 1)
-        self._shown = shown
-
-
 class StatePill(QLabel):
     """The process state as a coloured pill."""
 
@@ -1104,16 +644,12 @@ class StatePill(QLabel):
         super().__init__(parent)
         self.setFont(ui_font(0.95, QFont.Weight.Bold))
         self._color = STALE_COLOR.name()
-        self.set_state(DisplayState.UNKNOWN)
+        self.set_state(RuntimeState.UNKNOWN)
 
-    def set_state(self, state, stale: bool = False, text: str = "") -> None:
-        """Show ``state`` (either feed's, or a DisplayState), as ``text`` when
-        given (the backoff countdown), else by its name."""
-        state = display_state(state)
-        self.setText(text or STATE_LABELS[state])
-        self.setToolTip(state_tooltip(state))
+    def set_state(self, state: RuntimeState, stale: bool = False) -> None:
+        self.setText(STATE_LABELS.get(state, state.name.title()))
         self._color = STALE_COLOR.name() if stale else state_color(state)
-        self.setStyleSheet(solid_pill_style(self._color))
+        self.setStyleSheet(pill_style(self._color))
 
     def color(self) -> str:
         return self._color
@@ -1130,7 +666,7 @@ class StateBand(QWidget):
         self._since = 0.0
         self._now = 1.0
         self._stale = False
-        self.setToolTip(state_legend_html())
+        self.setToolTip("Process state over the last 15 minutes; a hole means no reports")
 
     def set_segments(
         self, segments: Sequence[Tuple[float, float, int]], since: float, now: float
@@ -1156,34 +692,15 @@ class StateBand(QWidget):
         p.fillPath(path, QColor(TILE_BG))
         p.setClipPath(path)
         span = max(self._now - self._since, 1e-9)
-        for start, end, value in self._segments:
+        for start, end, state in self._segments:
             x0 = (start - self._since) / span * rect.width()
             x1 = (end - self._since) / span * rect.width()
             if x1 - x0 < 1:
                 x1 = x0 + 1
-            state = stored_state(value)
-            color = QColor(state_color(state))
+            color = QColor(state_color(RuntimeState.from_byte(state)))
             if self._stale:
                 color.setAlpha(110)
-            segment = QRectF(x0, 0, x1 - x0, rect.height())
-            p.fillRect(segment, color)
-            if state in TRANSITIONAL_STATES:
-                self._stripe(p, segment)
-
-    @staticmethod
-    def _stripe(p: QPainter, segment: QRectF) -> None:
-        """Diagonal stripes over a segment, spaced by the band's height."""
-        height = segment.height()
-        p.save()
-        p.setClipRect(segment, Qt.ClipOperation.IntersectClip)
-        pen = QPen(QColor(0, 0, 0, 90))
-        pen.setWidthF(max(1.0, height / 5))
-        p.setPen(pen)
-        x = segment.left() - height
-        while x < segment.right():
-            p.drawLine(QPointF(x, segment.bottom()), QPointF(x + height, segment.top()))
-            x += height * 0.8
-        p.restore()
+            p.fillRect(QRectF(x0, 0, x1 - x0, rect.height()), color)
 
 
 class GraphsPanel(QWidget):
@@ -1474,7 +991,7 @@ class ProcessDetailPage(QWidget):
             button.setMinimumWidth(width)
         root.addLayout(header)
 
-        self.lbl_meta = QLabel("Waiting for a report…")
+        self.lbl_meta = QLabel("Waiting for a health report…")
         self.lbl_meta.setStyleSheet(mono_style(TEXT_DIM))
         self.lbl_meta.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.lbl_meta.setWordWrap(True)
@@ -1488,10 +1005,6 @@ class ProcessDetailPage(QWidget):
             tiles.addWidget(tile, i // 3, i % 3)
             self.tiles[key] = tile
         root.addLayout(tiles)
-
-        # What the manager measures beyond the health record (port 6668).
-        self.details = KeyValuePanel("Details · from the manager's detailed report", DETAIL_ROWS, NO_REPORT_TEXT)
-        root.addWidget(self.details)
 
         band_row = QHBoxLayout()
         band_row.setSpacing(10)
@@ -1544,25 +1057,16 @@ class ProcessDetailPage(QWidget):
         self.graphs.set_process(name)
         self.set_members(members or [])
         self.clear_journal()
-        self.details.set_values(None)  # the window follows with set_details
         if report is None:
             self._show_no_report()
         else:
             self.update_report(report, gpu)
         self.tick(time.monotonic(), time.time())
 
-    def set_details(self, record: Optional[dict], report: Optional[dict]) -> None:
-        """The process's record of the manager's detailed report, or None
-        while there is no (current) report: the panel explains instead."""
-        if record is None or report is None:
-            self.details.set_values(None)
-        else:
-            self.details.set_values(details_values(record, report))
-
     def update_report(self, report: dict, gpu) -> None:
         self.report = report
-        state = display_state(report["state"])
-        self.pill.set_state(state, self._stale, state_text(report))
+        state: RuntimeState = report["state"]
+        self.pill.set_state(state, self._stale)
         self.lbl_meta.setText(meta_text(report))
         gpu_pct, vram = gpu_texts(gpu)
         values = {
@@ -1580,8 +1084,8 @@ class ProcessDetailPage(QWidget):
 
     def _show_no_report(self) -> None:
         self.report = None
-        self.pill.set_state(DisplayState.UNKNOWN, self._stale)
-        self.lbl_meta.setText("Waiting for a report…")
+        self.pill.set_state(RuntimeState.UNKNOWN, self._stale)
+        self.lbl_meta.setText("Waiting for a health report…")
         for tile in self.tiles.values():
             tile.set_value("—")
         for button in self.buttons.values():
@@ -1614,12 +1118,9 @@ class ProcessDetailPage(QWidget):
         self._stale = stale
         for tile in self.tiles.values():
             tile.set_stale(stale)
-        if self.report:
-            self.pill.set_state(self.report["state"], stale, state_text(self.report))
-        else:
-            self.pill.set_state(DisplayState.UNKNOWN, stale)
+        state = self.report["state"] if self.report else RuntimeState.UNKNOWN
+        self.pill.set_state(state, stale)
         self.lbl_meta.setStyleSheet(mono_style(STALE_COLOR.name() if stale else TEXT_DIM))
-        self.details.set_stale(stale)
         self.band.set_stale(stale)
 
     def tick(self, now: float, wall_now: float) -> None:
@@ -1651,10 +1152,7 @@ class ProcessDetailPage(QWidget):
 
 
 class ServiceDetailPage(QWidget):
-    """The manager: whole-manager actions, the host overview from its report,
-    then systemctl status and the journal of the manager unit."""
-
-    command_requested = pyqtSignal(object, str)  # CommandEnum, "*" or "" for reload
+    """systemctl status and the journal of the manager unit."""
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -1671,16 +1169,9 @@ class ServiceDetailPage(QWidget):
         self.lbl_unit.setStyleSheet(mono_style(TEXT_DIM))
         header.addWidget(self.lbl_unit)
         header.addStretch()
-        # Enabled while the command link is up (set_link_up).
-        self.buttons: Dict[CommandEnum, QPushButton] = {}
-        for command, label, tip in MANAGER_ACTIONS:
-            button = QPushButton(label)
-            button.setStyleSheet(ACTION_STYLES[command])
-            button.setToolTip(tip)
-            button.setEnabled(False)
-            button.clicked.connect(lambda _checked=False, c=command: self._request(c))
-            header.addWidget(button)
-            self.buttons[command] = button
+        self.lbl_refresh = QLabel("Last refresh: —")
+        self.lbl_refresh.setStyleSheet(f"color: {TEXT_MUTED};")
+        header.addWidget(self.lbl_refresh)
         root.addLayout(header)
         # Fetch errors (no systemd, journalctl failed…) get a line of their own.
         self.lbl_error = QLabel()
@@ -1688,11 +1179,6 @@ class ServiceDetailPage(QWidget):
         self.lbl_error.setWordWrap(True)
         self.lbl_error.setVisible(False)
         root.addWidget(self.lbl_error)
-
-        # The manager's own figures (port 6668): shown on every platform, also
-        # where there is no systemd to ask.
-        self.host = KeyValuePanel("Host · from the manager's detailed report", HOST_ROWS, WAITING_REPORT_TEXT)
-        root.addWidget(self.host)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.setChildrenCollapsible(False)
@@ -1702,15 +1188,9 @@ class ServiceDetailPage(QWidget):
         status_layout = QVBoxLayout(status_box)
         status_layout.setContentsMargins(0, 0, 0, 0)
         status_layout.setSpacing(4)
-        status_row = QHBoxLayout()
         lbl_status = QLabel("systemctl status (unit metadata only)")
         lbl_status.setStyleSheet(f"color: {TEXT_DIM};")
-        status_row.addWidget(lbl_status)
-        status_row.addStretch()
-        self.lbl_refresh = QLabel("Last refresh: —")
-        self.lbl_refresh.setStyleSheet(f"color: {TEXT_MUTED};")
-        status_row.addWidget(self.lbl_refresh)
-        status_layout.addLayout(status_row)
+        status_layout.addWidget(lbl_status)
         self.txt_status = QPlainTextEdit()
         self.txt_status.setReadOnly(True)
         self.txt_status.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
@@ -1747,21 +1227,6 @@ class ServiceDetailPage(QWidget):
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([180, 420])
         root.addWidget(splitter, stretch=1)
-
-    def set_link_up(self, up: bool) -> None:
-        """Whole-manager actions need the command socket."""
-        for button in self.buttons.values():
-            button.setEnabled(up)
-
-    def _request(self, command: CommandEnum) -> None:
-        self.command_requested.emit(command, "" if command == CommandEnum.RELOAD else ALL_SERVICES)
-
-    def show_report(self, report: Optional[dict]) -> None:
-        """The latest detailed report, or None while there is none."""
-        self.host.set_values(host_values(report) if report else None)
-
-    def set_report_stale(self, stale: bool) -> None:
-        self.host.set_stale(stale)
 
     def show_snapshot(self, status: str, pairs: list, error: str) -> None:
         status = status or "(empty)"

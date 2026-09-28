@@ -8,8 +8,6 @@ DEALER wire format (exactly as specified by you):
     send(CommandMessage)          # packed: uint8 cmd + char[32] name + char[32] args
 
 SUB: receives array of DetailedHealthReport (raw or length-prefixed)
-SUB (report): the manager's detailed report, frames "report" + payload
-    (per-service GPU figures, threads, I/O, exit codes; host figures)
 
 Layout: the sidebar lists the manager unit and every reported process; the
 pane on the right shows the selection — metric tiles, a state band and the
@@ -29,7 +27,7 @@ from queue import Empty, SimpleQueue
 from typing import Deque, Dict, List, Optional, Tuple
 
 import zmq
-from PyQt6.QtCore import QObject, QSettings, QSize, QThread, QTimer, pyqtSignal, pyqtSlot, Qt
+from PyQt6.QtCore import QObject, QSize, QThread, QTimer, pyqtSignal, pyqtSlot, Qt
 from PyQt6.QtGui import QColor, QFont, QPalette, QTextOption
 from PyQt6.QtWidgets import (
     QApplication,
@@ -50,14 +48,11 @@ from PyQt6.QtWidgets import (
 )
 
 from health_structs import (
-    ALL_SERVICES,
-    REPORT_TOPIC,
     CommandEnum,
     describe_reply,
     make_command_message,
     parse_command_reply,
     parse_health_reports,
-    parse_report_frames,
     report_to_dict,
 )
 from gpu_sampler import GpuSampler, GpuProcessUsage
@@ -82,7 +77,6 @@ from process_views import (  # noqa: F401  re-exported
     ProcessDetailPage,
     ProcessSidebar,
     ServiceDetailPage,
-    display_state,
     mono_style,
     pill_style,
     service_active_text,
@@ -111,117 +105,34 @@ from usage_graphs import UsageGraphWindow, UsageHistory, UsageSample
 
 _color_for_pid = color_for_pid  # former name
 
-# The manager's default ports (docs/protocol.md), as a client on the same host sees them.
-DEFAULT_SUB_ENDPOINT = "tcp://127.0.0.1:6667"
-DEFAULT_DEALER_ENDPOINT = "tcp://127.0.0.1:5557"
-DEFAULT_REPORT_ENDPOINT = "tcp://127.0.0.1:6668"
-DEFAULT_ENDPOINTS = {
-    "sub": DEFAULT_SUB_ENDPOINT,
-    "dealer": DEFAULT_DEALER_ENDPOINT,
-    "report": DEFAULT_REPORT_ENDPOINT,
-}
-ENDPOINT_KEYS = ("sub", "dealer", "report")
-
-# Where the endpoints used last time are kept: an INI file per user
-# (%APPDATA%\beray\ProcessMonitor.ini, ~/.config/beray/ProcessMonitor.ini).
-SETTINGS_ORGANISATION = "beray"
-SETTINGS_APPLICATION = "ProcessMonitor"
-
-
-def open_settings() -> QSettings:
-    return QSettings(
-        QSettings.Format.IniFormat,
-        QSettings.Scope.UserScope,
-        SETTINGS_ORGANISATION,
-        SETTINGS_APPLICATION,
-    )
-
-
-def stored_endpoints(settings: QSettings) -> Dict[str, str]:
-    """The endpoints a previous run stored, by key ("sub", "dealer", "report")."""
-    found: Dict[str, str] = {}
-    for key in ENDPOINT_KEYS:
-        value = settings.value(f"endpoints/{key}", "", type=str)
-        if value:
-            found[key] = value
-    return found
-
-
-def store_endpoints(settings: QSettings, sub: str, dealer: str, report: str) -> None:
-    for key, value in (("sub", sub), ("dealer", dealer), ("report", report)):
-        settings.setValue(f"endpoints/{key}", value)
-    settings.sync()
-
-
-def resolve_endpoints(
-    given: Dict[str, Optional[str]], stored: Dict[str, str]
-) -> Tuple[str, str, str]:
-    """(sub, dealer, report): what the command line gave wins, then what was
-    stored last time, then the defaults."""
-    return tuple(  # type: ignore[return-value]
-        given.get(key) or stored.get(key) or DEFAULT_ENDPOINTS[key] for key in ENDPOINT_KEYS
-    )
-
-
-def command_question(command: CommandEnum, name: str) -> Optional[Tuple[str, str]]:
-    """(title, text) of the confirmation to ask before sending, or None when
-    none is needed: reloading the configuration and starting everything are
-    harmless; stopping or restarting a service, or all of them, are not."""
-    if command == CommandEnum.RELOAD:
-        return None
-    verb = command.name.lower()
-    if name == ALL_SERVICES:
-        if command == CommandEnum.START:
-            return None
-        return (
-            f"Confirm {verb} all",
-            f"Are you sure you want to <b>{verb}</b> <b>every service</b> the manager runs?",
-        )
-    return (
-        f"Confirm {command.name.title()}",
-        f"Are you sure you want to <b>{verb}</b> process <b>{name}</b>?",
-    )
-
-
-def command_label(command: CommandEnum, name: str) -> str:
-    """How a command is called in the status bar: "STOP for svc", "STOP for every service", "RELOAD"."""
-    if not name:
-        return command.name
-    return f"{command.name} for {'every service' if name == ALL_SERVICES else name}"
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ZMQ Worker
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ZmqWorker(QObject):
-    reports_received  = pyqtSignal(list)    # list[dict]
-    report_received   = pyqtSignal(object)  # dict: the detailed report (port 6668)
+    reports_received  = pyqtSignal(list)   # list[dict]
     connection_status = pyqtSignal(str)
     log_message       = pyqtSignal(str)
 
     def __init__(
         self,
-        sub_endpoint: str = DEFAULT_SUB_ENDPOINT,
-        dealer_endpoint: str = DEFAULT_DEALER_ENDPOINT,
+        sub_endpoint: str = "tcp://127.0.0.1:6667",
+        dealer_endpoint: str = "tcp://127.0.0.1:5557",
         sub_topic: bytes = b"",
         parent: Optional[QObject] = None,
-        report_endpoint: str = DEFAULT_REPORT_ENDPOINT,
     ):
         super().__init__(parent)
         self.sub_endpoint    = sub_endpoint
         self.dealer_endpoint = dealer_endpoint
         self.sub_topic       = sub_topic
-        self.report_endpoint = report_endpoint  # empty: the detailed report is not read
         self._running        = True   # until stop(); start() never re-arms it
         self._ctx: Optional[zmq.Context] = None
         self._sub: Optional[zmq.Socket] = None
-        self._report: Optional[zmq.Socket] = None
         self._dealer: Optional[zmq.Socket] = None
         self._command_queue: SimpleQueue = SimpleQueue()  # (label, payload)
         self._pending: Optional[Tuple[str, bytes]] = None  # command being sent
         self._pending_logged = False
-        self._report_error: Optional[str] = None  # last parse error shown
 
     @pyqtSlot()
     def start(self):
@@ -234,14 +145,6 @@ class ZmqWorker(QObject):
             self._sub.connect(self.sub_endpoint)
             self._sub.setsockopt(zmq.RCVTIMEO, 100)
 
-            # SUB for the detailed report: its own socket on the manager, topic "report"
-            if self.report_endpoint:
-                self._report = self._ctx.socket(zmq.SUB)
-                self._report.setsockopt(zmq.RCVHWM, 10)
-                self._report.setsockopt(zmq.SUBSCRIBE, REPORT_TOPIC)
-                self._report.connect(self.report_endpoint)
-                self._report.setsockopt(zmq.RCVTIMEO, 100)
-
             # DEALER – exact identity required by process manager
             self._dealer = self._ctx.socket(zmq.DEALER)
             self._dealer.setsockopt(zmq.IDENTITY, b"PMC")
@@ -253,8 +156,7 @@ class ZmqWorker(QObject):
             self.connection_status.emit("connected")
             self.log_message.emit(
                 f"SUB → {self.sub_endpoint}  |  "
-                + (f"REPORT → {self.report_endpoint}  |  " if self._report is not None else "")
-                + f"DEALER(identity=PMC) → {self.dealer_endpoint}"
+                f"DEALER(identity=PMC) → {self.dealer_endpoint}"
             )
         except zmq.ZMQError as e:
             self.connection_status.emit(f"error: {e}")
@@ -264,8 +166,6 @@ class ZmqWorker(QObject):
 
         poller = zmq.Poller()
         poller.register(self._sub, zmq.POLLIN)
-        if self._report is not None:
-            poller.register(self._report, zmq.POLLIN)
         # The C++ manager answers every command; older managers never do.
         poller.register(self._dealer, zmq.POLLIN)
 
@@ -319,9 +219,6 @@ class ZmqWorker(QObject):
                 except Exception as e:
                     self.log_message.emit(f"Recv error: {e}")
 
-            if self._report is not None and self._report in events:
-                self._read_report()
-
             if self._dealer in events:
                 self._read_replies()
 
@@ -330,27 +227,6 @@ class ZmqWorker(QObject):
 
     def stop(self):
         self._running = False
-
-    def _read_report(self) -> None:
-        """One detailed report; a payload this reader cannot parse is reported once."""
-        try:
-            frames = self._report.recv_multipart(flags=zmq.NOBLOCK)
-        except zmq.Again:
-            return
-        except zmq.ZMQError as e:
-            self.log_message.emit(f"Report recv error: {e}")
-            return
-        try:
-            report = parse_report_frames(frames)
-        except ValueError as e:
-            # Every interval brings another one; say it once, not each time.
-            if str(e) != self._report_error:
-                self._report_error = str(e)
-                self.log_message.emit(f"Report parse error: {e}")
-            return
-        if report is not None:
-            self._report_error = None
-            self.report_received.emit(report)
 
     def _read_replies(self) -> None:
         """Show each reply in the status bar, e.g. "restart vision: ok (restarting)"."""
@@ -369,15 +245,12 @@ class ZmqWorker(QObject):
     def send_command(self, command: CommandEnum, service_name: str, args: str = ""):
         """Thread-safe: SimpleQueue from any thread; worker drains it."""
         payload = make_command_message(command, service_name, args)
-        self._command_queue.put((command_label(command, service_name), payload))
+        self._command_queue.put((f"{command.name} for {service_name}", payload))
 
     def _cleanup(self):
         if self._sub:
             self._sub.close(linger=0)
             self._sub = None
-        if self._report:
-            self._report.close(linger=0)
-            self._report = None
         if self._dealer:
             self._dealer.close(linger=0)
             self._dealer = None
@@ -424,9 +297,7 @@ class SystemdLogWorker(QObject):
 
 
 class GpuSampleWorker(QObject):
-    """nvidia-smi sampling off the UI thread, while not paused. It starts
-    paused: the window runs it only when the manager measures no GPU use
-    itself, and nvidia-smi is not even probed before then."""
+    """nvidia-smi sampling off the UI thread."""
 
     sampled = pyqtSignal(object, object, bool)  # map, error_or_None, available
     finished = pyqtSignal()
@@ -434,17 +305,25 @@ class GpuSampleWorker(QObject):
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
         self._running = True  # until stop(); start() never re-arms it
-        self._paused = True  # set from the UI thread; a plain bool is enough
         self._sampler: Optional[GpuSampler] = None
-
-    def set_paused(self, paused: bool) -> None:
-        self._paused = paused
 
     @pyqtSlot()
     def start(self):
+        self._sampler = GpuSampler()
+        self._sampler.init()
         while self._running:
-            if not self._paused:
-                self._sample()
+            try:
+                if not self._sampler.available():
+                    self.sampled.emit({}, self._sampler.last_error(), False)
+                else:
+                    result = self._sampler.sample()
+                    err = None
+                    if self._sampler.last_error() and not result:
+                        err = self._sampler.last_error()
+                        result = {}
+                    self.sampled.emit(result, err, True)
+            except Exception as e:
+                self.sampled.emit({}, str(e), False)
             slept = 0
             while self._running and slept < 1000:
                 QThread.msleep(100)
@@ -452,23 +331,6 @@ class GpuSampleWorker(QObject):
         if self._sampler:
             self._sampler.shutdown()
         self.finished.emit()
-
-    def _sample(self) -> None:
-        try:
-            if self._sampler is None:
-                self._sampler = GpuSampler()
-                self._sampler.init()
-            if not self._sampler.available():
-                self.sampled.emit({}, self._sampler.last_error(), False)
-                return
-            result = self._sampler.sample()
-            err = None
-            if self._sampler.last_error() and not result:
-                err = self._sampler.last_error()
-                result = {}
-            self.sampled.emit(result, err, True)
-        except Exception as e:
-            self.sampled.emit({}, str(e), False)
 
     def stop(self):
         self._running = False
@@ -723,36 +585,6 @@ def cpu_percent(
     return min(delta_cpu / (delta_ns / 1000.0) * 100.0, CPU_PCT_MAX)
 
 
-def service_view(
-    health: Optional[dict], record: Optional[dict], report: Optional[dict]
-) -> dict:
-    """What the pages show for one service, in the health record's keys: from
-    the service's ``record`` of the manager's detailed ``report`` when there is
-    one, else from its ``health`` record. The state is a DisplayState either way,
-    and ``source`` says which feed it came from."""
-    if record is None or report is None:
-        view = dict(health or {})
-        view["state"] = display_state(view.get("state"))
-        view["source"] = "health"
-        return view
-    return {
-        "processName": record["name"],
-        "pid": int(record.get("pid", 0) or 0),
-        "state": display_state(record.get("state")),
-        "memoryUsageInBytes": int(record.get("memoryBytes", 0) or 0),
-        # The manager's own figure, over its publish interval: no second
-        # report needed, and the same number as the details panel.
-        "_cpu_pct": record.get("cpuPercent"),
-        "start_time": int(record.get("startTime", 0) or 0),
-        "lastSeen": int(record.get("lastSeen", 0) or 0),
-        "missedBeats": int(record.get("missedBeats", 0) or 0),
-        "restartCount": int(record.get("restartCount", 0) or 0),
-        "snapshotTime": int(report.get("snapshotTime", 0) or 0),
-        "nextRestartTime": int(record.get("nextRestartTime", 0) or 0),
-        "source": "report",
-    }
-
-
 class FeedMonitor:
     """Tells live health data from stale, from when reports arrive.
 
@@ -763,7 +595,6 @@ class FeedMonitor:
     def __init__(self) -> None:
         self.connected_at: Optional[float] = None
         self.last_report_at: Optional[float] = None
-        self._last_snapshot_at: Optional[float] = None
         self._gaps: Deque[float] = deque(maxlen=8)
 
     def on_connected(self, now: float) -> None:
@@ -773,18 +604,9 @@ class FeedMonitor:
     def on_disconnected(self) -> None:
         self.connected_at = None
 
-    def on_report(self, now: float, new_snapshot: bool = True) -> None:
-        """Data arrived. The manager sends each snapshot on two sockets (health
-        record and detailed report): both prove the feed live, only the first
-        of a snapshot counts toward the interval between reports."""
-        if new_snapshot:
-            if (
-                self.connected_at is not None
-                and self._last_snapshot_at is not None
-                and self._last_snapshot_at >= self.connected_at
-            ):
-                self._gaps.append(now - self._last_snapshot_at)
-            self._last_snapshot_at = now
+    def on_report(self, now: float) -> None:
+        if self._received_since_connect():
+            self._gaps.append(now - self.last_report_at)
         self.last_report_at = now
 
     def _received_since_connect(self) -> bool:
@@ -882,47 +704,24 @@ class ProcessMonitorWindow(QMainWindow):
         sub_endpoint: str,
         dealer_endpoint: str,
         parent: Optional[QWidget] = None,
-        report_endpoint: str = DEFAULT_REPORT_ENDPOINT,
-        settings: Optional[QSettings] = None,
     ):
         super().__init__(parent)
         self.sub_endpoint    = sub_endpoint
         self.dealer_endpoint = dealer_endpoint
-        self.report_endpoint = report_endpoint
-        self._settings = settings  # the endpoints used are stored here, when given
 
         self.setWindowTitle("Process Manager – Health Monitor")
         fit_to_screen(self, QSize(1180, 760), minimum=QSize(900, 600))
 
         self._prev: Dict[str, Tuple[int, int]] = {}   # name → (cpu_usec, snap_ns)
-        self._health: Dict[str, dict] = {}  # the latest health records, by name
-        # What the pages show, by name: the detailed report's records while it
-        # is current, else the health records (service_view).
         self._current: Dict[str, dict] = {}
-        self._feed_snapshot: Optional[int] = None  # the newest manager snapshot seen
-        # The last snapshot in the graphs: which, when, and from which socket.
-        self._recorded_snapshot: Optional[int] = None
-        self._recorded_at = 0.0
-        self._recorded_from_report = False
         self._gpu_by_pid: Dict[int, GpuProcessUsage] = {}
         self._log_windows: Dict[str, ProcessLogWindow] = {}
         self._cgroup_members: dict = {}
         self._feed = FeedMonitor()
         self._stale = False  # the pages show data that stopped updating
         self._link_status: Optional[Tuple[str, str, str]] = None
-        # This machine's nvidia-smi: only a fallback for a manager that measures
-        # no GPU use itself, so it waits for the first report (_update_gpu_sampler).
-        self._gpu_paused = True
-        self._gpu_wait_since = time.monotonic()
-        self._gpu_error: Optional[str] = None
+        self._last_gpu_error: Optional[str] = None
         self._gpu_available = False
-        self._gpu_status: Optional[Tuple[str, str, str]] = None
-        # The detailed report (port 6668): the latest one, when it came, and
-        # its service records by name.
-        self._report: Optional[dict] = None
-        self._report_at: Optional[float] = None
-        self._report_services: Dict[str, dict] = {}
-        self._report_state: Optional[Tuple[bool, bool]] = None  # (greyed, current)
         self._usage = UsageHistory()  # recorded from the start, for the graphs
         self._usage_window: Optional[UsageGraphWindow] = None
         self._auto_select = True  # show the first process once reports arrive
@@ -967,7 +766,7 @@ class ProcessMonitorWindow(QMainWindow):
 
         self.lbl_gpu = QLabel("GPU …")
         toolbar.addWidget(self.lbl_gpu)
-        self._refresh_gpu_status()
+        self._update_gpu_status_label(False, "GPU sampler starting…")
 
         self.btn_connection = QToolButton()
         self.btn_connection.setText("Connection")
@@ -989,16 +788,6 @@ class ProcessMonitorWindow(QMainWindow):
         self.edit_sub.setClearButtonEnabled(True)
         self.edit_sub.returnPressed.connect(self._reconnect)
         strip.addWidget(self.edit_sub)
-        strip.addSpacing(8)
-        strip.addWidget(QLabel("REPORT"))
-        self.edit_report = QLineEdit(self.report_endpoint)
-        self.edit_report.setPlaceholderText("tcp://host:port")
-        self.edit_report.setToolTip(
-            "ZMQ SUB endpoint for the manager's detailed report (topic 'report')"
-        )
-        self.edit_report.setClearButtonEnabled(True)
-        self.edit_report.returnPressed.connect(self._reconnect)
-        strip.addWidget(self.edit_report)
         strip.addSpacing(8)
         strip.addWidget(QLabel("DEALER"))
         self.edit_dealer = QLineEdit(self.dealer_endpoint)
@@ -1044,7 +833,6 @@ class ProcessMonitorWindow(QMainWindow):
         self.detail.pid_activated.connect(self._on_pid_activated)
         self.detail.pop_out_requested.connect(self._open_usage_graphs)
         self.service_page = ServiceDetailPage()
-        self.service_page.command_requested.connect(self._send_cmd)
         self.stack = QStackedWidget()
         self.stack.addWidget(self.service_page)
         self.stack.addWidget(self.detail)
@@ -1092,8 +880,7 @@ class ProcessMonitorWindow(QMainWindow):
 
     def _show_endpoints(self) -> None:
         self.lbl_endpoints.setText(
-            f"SUB {self.sub_endpoint}   ·   REPORT {self.report_endpoint}   ·   "
-            f"DEALER {self.dealer_endpoint}"
+            f"SUB {self.sub_endpoint}   ·   DEALER {self.dealer_endpoint}"
         )
 
     def _show_status(self, message: str) -> None:
@@ -1108,9 +895,8 @@ class ProcessMonitorWindow(QMainWindow):
         self.stack.setCurrentWidget(self.detail)
         report = self._current.get(name)
         self.detail.set_process(
-            name, report, self._gpu_for(report, name), self._cgroup_members.get(name) or []
+            name, report, self._gpu_for(report), self._cgroup_members.get(name) or []
         )
-        self.detail.set_details(self._details_for(name), self._report)
         self.detail.set_stale(self._stale)
         worker = getattr(self, "detail_journal_worker", None)
         if worker is not None:
@@ -1123,62 +909,10 @@ class ProcessMonitorWindow(QMainWindow):
         if worker is not None:
             worker.set_process("")  # nothing to tail while the manager is shown
 
-    def _gpu_for(self, report: Optional[dict], name: str = "") -> Optional[GpuProcessUsage]:
-        """GPU use of a process: the manager's figures (NVML on its host, summed
-        over the service's processes) when it has them, else local nvidia-smi
-        joined by PID, else None."""
-        if not report:
-            return None
-        record = self._details_for(name or report.get("processName", ""))
-        if record is not None and record.get("gpuValid"):
-            return GpuProcessUsage(
-                util_pct=record.get("gpuPercent"), vram_bytes=int(record.get("gpuMemoryBytes", 0))
-            )
-        if not report.get("pid"):
+    def _gpu_for(self, report: Optional[dict]) -> Optional[GpuProcessUsage]:
+        if not report or not report.get("pid"):
             return None
         return self._gpu_by_pid.get(report["pid"])
-
-    # ── the detailed report ───────────────────────────────────────────────
-
-    def _report_age_stale(self) -> bool:
-        return (
-            self._report_at is not None
-            and time.monotonic() - self._report_at > self._feed.stale_after()
-        )
-
-    def _report_current(self) -> bool:
-        """A report arrived recently, or the whole feed is stale (then the last
-        report stays on show, greyed out like everything else)."""
-        return self._report_at is not None and (self._stale or not self._report_age_stale())
-
-    def _details_for(self, name: str) -> Optional[dict]:
-        """The service's record of the detailed report, while the report is current."""
-        return self._report_services.get(name) if self._report_current() else None
-
-    def _manager_gpu(self) -> bool:
-        """The manager measures GPU use itself (NVML on its host)."""
-        return self._report_current() and bool(self._report and self._report.get("gpuMonitoring"))
-
-    def _apply_report_state(self) -> None:
-        """Grey the host overview when the report (or the feed) is stale; drop
-        the details and the manager's GPU figures once the report is gone."""
-        state = (self._stale or self._report_age_stale(), self._report_current())
-        if state == self._report_state:
-            return
-        self._report_state = state
-        self.service_page.set_report_stale(state[0])
-        self._refresh_gpu_status()
-        self._refresh_detail()
-
-    @pyqtSlot(object)
-    def _on_report(self, report) -> None:
-        if not isinstance(report, dict):
-            return
-        self._report = report
-        self._report_at = time.monotonic()
-        self._report_services = {s["name"]: s for s in report.get("services", [])}
-        self.service_page.show_report(report)
-        self._on_feed(int(report.get("snapshotTime", 0) or 0), from_report=True)
 
     def _refresh_detail(self) -> None:
         name = self.detail.name
@@ -1186,41 +920,33 @@ class ProcessMonitorWindow(QMainWindow):
             return
         report = self._current.get(name)
         if report is not None:
-            self.detail.update_report(report, self._gpu_for(report, name))
-        self.detail.set_details(self._details_for(name), self._report)
+            self.detail.update_report(report, self._gpu_for(report))
 
     def _apply_stale(self) -> None:
         self.sidebar.set_stale(self._stale)
         self.detail.set_stale(self._stale)
-        self._apply_report_state()
 
     # ── ZMQ worker lifecycle ──────────────────────────────────────────────
 
-    def _get_endpoints(self) -> tuple[str, str, str]:
+    def _get_endpoints(self) -> tuple[str, str]:
         sub    = self.edit_sub.text().strip()    or self.sub_endpoint
         dealer = self.edit_dealer.text().strip() or self.dealer_endpoint
-        report = self.edit_report.text().strip() or self.report_endpoint
-        return sub, dealer, report
+        return sub, dealer
 
     def _start_zmq_worker(self):
-        sub, dealer, report = self._get_endpoints()
+        sub, dealer = self._get_endpoints()
         self.sub_endpoint    = sub
         self.dealer_endpoint = dealer
-        self.report_endpoint = report
         self.edit_sub.setText(sub)
         self.edit_dealer.setText(dealer)
-        self.edit_report.setText(report)
         self._show_endpoints()
-        if self._settings is not None:
-            store_endpoints(self._settings, sub, dealer, report)
 
         self.worker_thread = QThread()
-        self.worker = ZmqWorker(sub, dealer, report_endpoint=report)
+        self.worker = ZmqWorker(sub, dealer)
         self.worker.moveToThread(self.worker_thread)
 
         self.worker_thread.started.connect(self.worker.start)
         self.worker.reports_received.connect(self._on_reports)
-        self.worker.report_received.connect(self._on_report)
         self.worker.connection_status.connect(self._on_connection_status)
         self.worker.log_message.connect(self._on_log)
 
@@ -1230,7 +956,6 @@ class ProcessMonitorWindow(QMainWindow):
         if hasattr(self, "worker") and self.worker is not None:
             for sig in (
                 self.worker.reports_received,
-                self.worker.report_received,
                 self.worker.connection_status,
                 self.worker.log_message,
             ):
@@ -1318,69 +1043,30 @@ class ProcessMonitorWindow(QMainWindow):
 
     @pyqtSlot(list)
     def _on_reports(self, reports: List[dict]):
-        """Health records: what the pages show when there is no current
-        detailed report (an older manager, or port 6668 out of reach)."""
-        health: Dict[str, dict] = {}
+        new_current: Dict[str, dict] = {}
         for r in reports:
             name = r["processName"]
             r["_cpu_pct"] = cpu_percent(
                 self._prev.get(name), r["cpuUsageInUsec"], r["snapshotTime"]
             )
             self._prev[name] = (r["cpuUsageInUsec"], r["snapshotTime"])
-            health[name] = r
-        for gone in set(self._health) - set(health):
+            new_current[name] = r
+
+        for gone in set(self._current) - set(new_current):
             self._prev.pop(gone, None)
-        self._health = health
-        snapshot = reports[0]["snapshotTime"] if reports else None
-        self._on_feed(snapshot, from_report=False)
+        self._current = new_current
+        if getattr(self, "cgroup_members_worker", None):
+            self.cgroup_members_worker.set_names(sorted(self._current.keys()))
 
-    def _new_snapshot(self, snapshot: Optional[int]) -> bool:
-        """The first arrival of a manager snapshot. An empty health frame has no
-        time: it stands for a snapshot of its own only while no report is current."""
-        if snapshot is None:
-            return not self._report_current()
-        return snapshot != self._feed_snapshot
-
-    def _rebuild_view(self) -> None:
-        records = self._report_services if self._report_current() else {}
-        report = self._report if records else None
-        self._current = {
-            name: service_view(self._health.get(name), records.get(name), report)
-            for name in set(self._health) | set(records)
-        }
-
-    def _on_feed(self, snapshot: Optional[int], from_report: bool) -> None:
-        """Either socket delivered. Every arrival proves the feed live and
-        rebuilds what the pages show; the graphs take one sample per manager
-        snapshot, from the feed the pages are built from."""
         now = time.monotonic()
-        new = self._new_snapshot(snapshot)
-        if new and snapshot is not None:
-            self._feed_snapshot = snapshot
-        self._feed.on_report(now, new_snapshot=new)
+        self._feed.on_report(now)
         interval = self._feed.report_interval()
         if interval is not None:
             self._usage.set_report_interval(interval)
-        # Live again before the view is rebuilt: a stale feed keeps the last
-        # report on show (_report_current), a live one lets it lapse.
-        was_stale, self._stale = self._stale, False
-        self._rebuild_view()
-        if was_stale:
+        self._record_usage(now)
+        if self._stale:
+            self._stale = False
             self._apply_stale()
-        self._apply_report_state()
-        self._update_gpu_sampler()
-        if getattr(self, "cgroup_members_worker", None):
-            self.cgroup_members_worker.set_names(sorted(self._current.keys()))
-        if from_report == self._report_current():
-            if snapshot is None or snapshot != self._recorded_snapshot:
-                self._recorded_snapshot, self._recorded_at = snapshot, now
-                self._recorded_from_report = from_report
-                self._record_usage(now)
-            elif from_report and not self._recorded_from_report:
-                # This snapshot went into the graphs from its health records a
-                # moment ago, before a report counted; the report says more.
-                self._recorded_from_report = True
-                self._record_usage(now, replace_since=self._recorded_at)
         shown = self.detail.name
         if self.stack.currentWidget() is self.detail and shown and shown not in self._current:
             self.sidebar.select_manager()  # the shown process left the reports
@@ -1402,15 +1088,13 @@ class ProcessMonitorWindow(QMainWindow):
             self._auto_select = False
             self.sidebar.select_process(visible[0])
 
-    def _record_usage(self, now: float, replace_since: Optional[float] = None) -> None:
-        """Sample every process for the usage graphs and the state band (in
-        place of the samples taken since ``replace_since``, when given)."""
+    def _record_usage(self, now: float) -> None:
+        """Sample every process for the usage graphs and the state band."""
         for name, r in self._current.items():
-            gpu = self._gpu_for(r, name)
-            if gpu is not None:
-                gpu_pct, vram = gpu.util_pct, gpu.vram_bytes
-            elif self._gpu_available or self._manager_gpu():
-                gpu_pct, vram = 0.0, 0  # measured, and not on the list: using none of it
+            gpu = self._gpu_by_pid.get(r["pid"]) if r["pid"] else None
+            if self._gpu_available:  # not on the GPU list: using none of it
+                gpu_pct = gpu.util_pct if gpu else 0.0
+                vram = gpu.vram_bytes if gpu else 0
             else:
                 gpu_pct = vram = None
             state = r.get("state")
@@ -1422,16 +1106,14 @@ class ProcessMonitorWindow(QMainWindow):
                     r["memoryUsageInBytes"],
                     gpu_pct,
                     vram,
-                    None if state is None else int(display_state(state)),
+                    None if state is None else int(state),
                 ),
-                replace_since,
             )
         self._usage.prune(now)
 
     @pyqtSlot(str)
     def _on_connection_status(self, status: str):
         self._link_up = status == "connected"
-        self.service_page.set_link_up(self._link_up)
         if status == "connected":
             # Sockets are up; the feed only counts as live once reports arrive.
             self._feed.on_connected(time.monotonic())
@@ -1450,23 +1132,16 @@ class ProcessMonitorWindow(QMainWindow):
         if stale != self._stale:
             self._stale = stale
             self._apply_stale()  # grey out / restore the pages
-        self._apply_report_state()
-        self._update_gpu_sampler()
         if self.stack.currentWidget() is self.detail:
             self.detail.tick(now, time.time())
         status = self._feed.status(now)
         if status is None:  # not connected: keep the error / reconnect text
             return
         text, level = status
-        if self._report_current():
-            source = f"the detailed report from {self.report_endpoint}"
-        else:
-            source = f"health records from {self.sub_endpoint} (no detailed report)"
         tips = {
-            "live": f"Receiving {source}",
-            "waiting": f"Connected to {self.sub_endpoint} and {self.report_endpoint}; "
-                       "nothing received yet",
-            "stale": f"Nothing received from {self.sub_endpoint} or {self.report_endpoint}"
+            "live": f"Receiving health reports from {self.sub_endpoint}",
+            "waiting": f"Connected to {self.sub_endpoint}; no health report yet",
+            "stale": f"No health reports from {self.sub_endpoint}"
                      + ("; the pages show the last values received (greyed out)"
                         if self._current else ""),
         }
@@ -1484,79 +1159,32 @@ class ProcessMonitorWindow(QMainWindow):
     def _on_log(self, msg: str):
         self._show_status(msg)
 
-    def _local_gpu_wanted(self, now: float) -> bool:
-        """Sample GPU use with this machine's nvidia-smi: only while the manager
-        measures none itself, and once its first report has had time to say so."""
-        if self._manager_gpu():
-            return False
-        waiting = self._report_at is None and now - self._gpu_wait_since < self._feed.stale_after()
-        return not waiting
-
-    def _update_gpu_sampler(self) -> None:
-        paused = not self._local_gpu_wanted(time.monotonic())
-        if paused != self._gpu_paused:
-            self._gpu_paused = paused
-            worker = getattr(self, "gpu_worker", None)
-            if worker is not None:
-                worker.set_paused(paused)
-            if paused:
-                self._gpu_by_pid = {}
-                self._gpu_available = False
-                self._gpu_error = None
-        self._refresh_gpu_status()
-
-    def gpu_source(self) -> Tuple[str, str, str]:
-        """(text, colour, tooltip) of the toolbar pill: where GPU figures come from."""
-        if self._manager_gpu():
-            return (
-                "GPU · manager",
-                "#4caf50",
-                "GPU figures measured on the manager's host (NVML), summed over each "
-                "service's processes; this machine's nvidia-smi is not run",
-            )
-        if self._gpu_paused:
-            return (
-                "GPU · waiting",
-                TEXT_MUTED,
-                "Waiting for the manager's detailed report to say whether it measures "
-                "GPU use; otherwise this machine's nvidia-smi is used",
-            )
-        if self._gpu_available:
-            return (
-                "GPU · nvidia-smi",
-                "#4caf50",
-                "GPU figures from this machine's nvidia-smi, joined by PID: only right "
-                "when the GUI runs on the manager's host",
-            )
-        return (
-            "GPU unavailable",
-            "#f44336",
-            (self._gpu_error or "nvidia-smi unavailable")
-            + "; the manager reports no GPU monitoring",
-        )
-
-    def _refresh_gpu_status(self) -> None:
-        status = self.gpu_source()
-        if status == self._gpu_status:
-            return
-        self._gpu_status = status
-        text, color, tooltip = status
-        self.lbl_gpu.setText(text)
-        self.lbl_gpu.setStyleSheet(pill_style(color))
-        self.lbl_gpu.setToolTip(tooltip)
+    def _update_gpu_status_label(
+        self, available: bool, err: Optional[str] = None
+    ) -> None:
+        if available:
+            self.lbl_gpu.setText("GPU ok")
+            self.lbl_gpu.setStyleSheet(pill_style("#4caf50"))
+            self.lbl_gpu.setToolTip("nvidia-smi sampling active")
+        else:
+            self.lbl_gpu.setText("GPU unavailable")
+            self.lbl_gpu.setStyleSheet(pill_style("#f44336"))
+            self.lbl_gpu.setToolTip(err or "nvidia-smi unavailable")
 
     @pyqtSlot(object, object, bool)
     def _on_gpu_sampled(self, result, err, available: bool):
-        if self._gpu_paused:
-            return  # a sample that was under way when the manager's figures came
         new_map: Dict[int, GpuProcessUsage] = result if result else {}
         failed = bool(err) and not new_map
-        # A failure shows in the GPU pill (red, the error in its tooltip), not
-        # in the status bar, which is for what the user did.
-        self._gpu_by_pid = {} if failed else new_map
+        if failed:
+            self._gpu_by_pid = {}
+            # Samples come every second; post an error once, not each time.
+            if err != self._last_gpu_error:
+                self._show_status(f"GPU sample error: {err}")
+        else:
+            self._gpu_by_pid = new_map
+        self._last_gpu_error = err if failed else None
         self._gpu_available = available and not failed
-        self._gpu_error = err if isinstance(err, str) else None
-        self._refresh_gpu_status()
+        self._update_gpu_status_label(self._gpu_available, err if isinstance(err, str) else None)
         self._refresh_detail()
 
     @pyqtSlot(object)
@@ -1609,52 +1237,34 @@ class ProcessMonitorWindow(QMainWindow):
         self.btn_reconnect.setEnabled(False)
         self._feed.on_disconnected()
         self._link_up = False
-        self.service_page.set_link_up(False)
         self._prev.clear()
-        self._health = {}
-        self._feed_snapshot = self._recorded_snapshot = None
-        self._gpu_wait_since = time.monotonic()  # the new manager's report decides again
-        self._forget_report()
         self._set_link_status("Reconnecting…", "orange")
 
         self._stop_zmq_worker(timeout_ms=4000)
         self._start_zmq_worker()
         self.btn_reconnect.setEnabled(True)
         self._show_status(
-            f"Connecting to SUB={self.sub_endpoint}  REPORT={self.report_endpoint}  "
+            f"Connecting to SUB={self.sub_endpoint}  "
             f"DEALER={self.dealer_endpoint}  (id=PMC)"
         )
 
-    def _forget_report(self) -> None:
-        """The next connection starts without a report, like the first one."""
-        self._report = None
-        self._report_at = None
-        self._report_services = {}
-        self._report_state = None
-        self.service_page.show_report(None)
-        self._apply_report_state()
-
     def _send_cmd(self, cmd: CommandEnum, name: str):
-        """A command for one process, for every service ("*") or, for reload,
-        for the manager itself (an empty name). The manager's reply lands in
-        the status bar through the worker."""
-        question = command_question(cmd, name)
-        if question is not None:
-            reply = QMessageBox.question(
-                self,
-                question[0],
-                question[1],
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
+        reply = QMessageBox.question(
+            self,
+            f"Confirm {cmd.name.title()}",
+            f"Are you sure you want to <b>{cmd.name.lower()}</b> process "
+            f"<b>{name}</b>?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
         if not getattr(self, "worker", None) or not self._link_up:
             self._show_status("Not connected — command not sent")
             return
         self.worker.send_command(cmd, name, args="")
         # The worker reports "Sent …" once the command is actually handed off.
-        self._show_status(f"Sending {command_label(cmd, name)}…")
+        self._show_status(f"Sending {cmd.name} for {name}…")
 
     def closeEvent(self, event):
         for w in list(self._log_windows.values()):
@@ -1691,32 +1301,20 @@ def main():
     )
     parser.add_argument(
         "--sub",
-        help=f"ZMQ SUB endpoint for the health report (default: the one used last time, else {DEFAULT_SUB_ENDPOINT})",
+        default="tcp://127.0.0.1:6667",
+        help="ZMQ SUB endpoint (default: tcp://127.0.0.1:6667)",
     )
     parser.add_argument(
         "--dealer",
-        help=f"ZMQ DEALER endpoint for commands (default: the one used last time, else {DEFAULT_DEALER_ENDPOINT})",
-    )
-    parser.add_argument(
-        "--report",
-        help=f"ZMQ SUB endpoint for the detailed report (default: the one used last time, else {DEFAULT_REPORT_ENDPOINT})",
-    )
-    parser.add_argument(
-        "--no-remember",
-        action="store_true",
-        help="neither read nor store the endpoints used last time",
+        default="tcp://127.0.0.1:5557",
+        help="ZMQ DEALER endpoint (default: tcp://127.0.0.1:5557)",
     )
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
     apply_dark_theme(app)
 
-    settings = None if args.no_remember else open_settings()
-    stored = stored_endpoints(settings) if settings is not None else {}
-    sub, dealer, report = resolve_endpoints(
-        {"sub": args.sub, "dealer": args.dealer, "report": args.report}, stored
-    )
-    win = ProcessMonitorWindow(sub, dealer, report_endpoint=report, settings=settings)
+    win = ProcessMonitorWindow(args.sub, args.dealer)
     win.show()
     sys.exit(app.exec())
 
